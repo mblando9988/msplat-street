@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.21)
-project(msplat LANGUAGES CXX OBJCXX)
+project(msplat LANGUAGES CXX)
+
+# Apple builds use the Metal backend; elsewhere the CPU backend (core/cpu) implements
+# the same interface (core/metal/bindings.h), so training runs on Linux too.
+if(APPLE)
+    enable_language(OBJCXX)
+    set(MSPLAT_BACKEND "metal")
+else()
+    set(MSPLAT_BACKEND "cpu")
+endif()
+message(STATUS "msplat backend: ${MSPLAT_BACKEND}")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +49,8 @@ FetchContent_Declare(cli11
     URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip)
 FetchContent_MakeAvailable(nlohmann_json cli11)
 
+if(MSPLAT_BACKEND STREQUAL "metal")
+
 # Metal frameworks
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK Metal REQUIRED)
@@ -70,11 +82,29 @@ add_custom_command(
 add_custom_target(metallib ALL
     DEPENDS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib)
 
+set(MSPLAT_BACKEND_SOURCES
+    core/metal/msplat_metal.mm
+    core/src/msplat_api.mm
+    core/src/loaders/image_io.cpp
+)
+
+else()
+
+# CPU backend: multithreaded C++ ports of the Metal kernels, stb for image I/O.
+# MSPLAT_CPU_NATIVE tunes the build for this machine (not for redistributable wheels).
+option(MSPLAT_CPU_NATIVE "Optimize the CPU backend for the build machine (-march=native)" ON)
+find_package(Threads REQUIRED)
+set(MSPLAT_BACKEND_SOURCES
+    core/cpu/msplat_cpu.cpp
+    core/src/loaders/image_io_stb.cpp
+)
+
+endif()
+
 # --- Core static library ---
 
 add_library(msplat_core STATIC
-    core/metal/msplat_metal.mm
-    core/src/msplat_api.mm
+    ${MSPLAT_BACKEND_SOURCES}
     core/src/model.cpp
     core/src/input_data.cpp
     core/src/image_sizing.cpp
@@ -84,7 +114,6 @@ add_library(msplat_core STATIC
     core/src/loaders/load_nerfstudio.cpp
     core/src/loaders/load_polycam.cpp
     core/src/loaders/load_ply.cpp
-    core/src/loaders/image_io.cpp
     core/src/loaders/save_gaussians.cpp
     core/src/ssim.cpp
 )
@@ -92,17 +121,27 @@ target_include_directories(msplat_core PUBLIC
     ${CMAKE_SOURCE_DIR}/core/include
     ${CMAKE_SOURCE_DIR}/core/metal
 )
-target_link_libraries(msplat_core PUBLIC
-    ${FOUNDATION_LIBRARY}
-    ${METAL_FRAMEWORK}
-    ${METALKIT_FRAMEWORK}
-    ${MPS_FRAMEWORK}
-    ${IMAGEIO_FRAMEWORK}
-    ${COREGRAPHICS_FRAMEWORK}
-    nlohmann_json::nlohmann_json
-)
-target_compile_definitions(msplat_core PRIVATE USE_MPS)
-add_dependencies(msplat_core metallib)
+target_link_libraries(msplat_core PUBLIC nlohmann_json::nlohmann_json)
+if(MSPLAT_BACKEND STREQUAL "metal")
+    target_link_libraries(msplat_core PUBLIC
+        ${FOUNDATION_LIBRARY}
+        ${METAL_FRAMEWORK}
+        ${METALKIT_FRAMEWORK}
+        ${MPS_FRAMEWORK}
+        ${IMAGEIO_FRAMEWORK}
+        ${COREGRAPHICS_FRAMEWORK}
+    )
+    target_compile_definitions(msplat_core PRIVATE USE_MPS)
+    add_dependencies(msplat_core metallib)
+else()
+    target_include_directories(msplat_core PRIVATE ${CMAKE_SOURCE_DIR}/core/cpu)
+    target_include_directories(msplat_core SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party/stb)
+    target_link_libraries(msplat_core PUBLIC Threads::Threads)
+    if(MSPLAT_CPU_NATIVE)
+        target_compile_options(msplat_core PRIVATE -march=native)
+    endif()
+    set_target_properties(msplat_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # --- CLI binary ---
 
@@ -131,5 +170,7 @@ if(MSPLAT_BUILD_PYTHON)
     target_compile_definitions(_core PRIVATE USE_MPS)
 
     install(TARGETS _core LIBRARY DESTINATION msplat)
-    install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib DESTINATION msplat)
+    if(MSPLAT_BACKEND STREQUAL "metal")
+        install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib DESTINATION msplat)
+    endif()
 endif()

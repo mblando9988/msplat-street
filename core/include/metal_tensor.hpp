@@ -2,14 +2,39 @@
 #define METAL_TENSOR_H
 
 #include <vector>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
+// Device buffers are shared, reference-counted allocations: MTensor copies alias the
+// same memory and view() does not own it. With Metal they are MTLBuffers (retained
+// through CoreFoundation); without Metal (the CPU backend) they are host blocks with
+// the same semantics.
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+inline void mtensorRetain(void *b) { CFRetain(b); }
+inline void mtensorRelease(void *b) { CFRelease(b); }
+#else
+struct MTensorHostBuffer {
+    std::atomic<long> refs{1};
+    void *data = nullptr;
+};
+inline void mtensorRetain(void *b) {
+    static_cast<MTensorHostBuffer*>(b)->refs.fetch_add(1, std::memory_order_relaxed);
+}
+inline void mtensorRelease(void *b) {
+    auto *h = static_cast<MTensorHostBuffer*>(b);
+    if (h->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::free(h->data);
+        delete h;
+    }
+}
+#endif
 
 // Forward-declare the Metal buffer type for C++ compatibility.
 // Full Metal/Metal.h is only needed in .mm files.
@@ -35,6 +60,7 @@ inline size_t dtypeSize(DType dt) {
         case DType::UInt8:   return 1;
         case DType::Float64: return 8;
     }
+    return 0;
 }
 
 // Lightweight GPU tensor — wraps an MTLBuffer with shape metadata.
@@ -65,6 +91,28 @@ public:
     id<MTLBuffer> buffer() const { return (__bridge id<MTLBuffer>)_buffer; }
 #endif
 
+#ifndef __APPLE__
+    // Device allocation without Metal: a shared, zero-filled host block (gpu_empty /
+    // gpu_zeros in the CPU backend)
+    struct HostDevice {};
+    MTensor(HostDevice, std::vector<int64_t> shape, DType dtype)
+        : _shape(std::move(shape)), _dtype(dtype) {
+        _numel = 1;
+        for (auto s : _shape) _numel *= s;
+        size_t bytes = _numel * dtypeSize(_dtype);
+        if (bytes == 0) bytes = 4;
+        auto *h = new MTensorHostBuffer;
+        h->data = std::calloc(1, bytes);
+        if (!h->data) {
+            delete h;
+            throw std::runtime_error("msplat: host allocation failed for " + std::to_string(bytes) + " bytes");
+        }
+        _buffer = h;
+        _ownsBuffer = true;
+        _data = h->data;
+    }
+#endif
+
     // CPU allocation (no Metal buffer)
     MTensor(std::vector<int64_t> shape, DType dtype)
         : _shape(std::move(shape)), _dtype(dtype) {
@@ -80,7 +128,7 @@ public:
         : _buffer(o._buffer), _data(o._data), _cpu_data(o._cpu_data),
           _shape(o._shape), _dtype(o._dtype), _numel(o._numel),
           _ownsBuffer(o._ownsBuffer) {
-        if (_buffer && _ownsBuffer) CFRetain(_buffer);
+        if (_buffer && _ownsBuffer) mtensorRetain(_buffer);
     }
 
     MTensor(MTensor &&o) noexcept
@@ -94,7 +142,7 @@ public:
         if (this == &o) return *this;
         void *incoming = o._buffer;
         bool incomingOwns = o._ownsBuffer;
-        if (incoming && incomingOwns) CFRetain(incoming);  // retain before release: o may alias us
+        if (incoming && incomingOwns) mtensorRetain(incoming);  // retain before release: o may alias us
         releaseBuffer();
         _buffer = incoming; _ownsBuffer = incomingOwns;
         _data = o._data; _cpu_data = o._cpu_data;
@@ -183,7 +231,7 @@ public:
 
 private:
     void releaseBuffer() {
-        if (_buffer && _ownsBuffer) CFRelease(_buffer);
+        if (_buffer && _ownsBuffer) mtensorRelease(_buffer);
         _buffer = nullptr;
         _ownsBuffer = false;
     }
