@@ -1,0 +1,4 @@
+# Look Around imagery and derived datasets/renders are not redistributed
+data/
+runs/
+__pycache__/
