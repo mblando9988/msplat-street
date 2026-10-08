@@ -192,16 +192,17 @@ inline void sh_coeffs_to_color(uint32_t degree, float3 viewdir, const float *dc,
 
 // ── Projection VJPs ─────────────────────────────────────────────────────────
 
-// As in gsplat 0.1 (and the Metal kernel): the 1/w term of the perspective divide is
-// not differentiated, so this is the gradient at fixed depth.
+// Pixel position gradient back to the world point, through the perspective divide:
+// x_pix = W/2 * p_hom.x / p_hom.w + cx - 0.5, so the w row carries the depth term
+// (forward motion's looming parallax) that gsplat 0.1 left out.
 inline float3 project_pix_vjp(const float *mat, float3 p, uint32_t w, uint32_t h, float2 v_xy) {
     float4 p_hom = transform_4x4(mat, p);
     float rw = 1.f / (p_hom.w + 1e-6f);
-    float3 v_ndc(0.5f * (float)w * v_xy.x, 0.5f * (float)h * v_xy.y, 0.f);
-    float4 v_proj(v_ndc.x * rw, v_ndc.y * rw, 0.f, -(v_ndc.x + v_ndc.y) * rw * rw);
-    return {mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z,
-            mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z,
-            mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z};
+    float2 v_ndc(0.5f * (float)w * v_xy.x, 0.5f * (float)h * v_xy.y);
+    float4 v_proj(v_ndc.x * rw, v_ndc.y * rw, 0.f, -(v_ndc.x * p_hom.x + v_ndc.y * p_hom.y) * rw * rw);
+    return {mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z + mat[12] * v_proj.w,
+            mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z + mat[13] * v_proj.w,
+            mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z + mat[14] * v_proj.w};
 }
 
 inline void cov2d_to_conic_vjp(float3 conic, float3 v_conic, float *v_cov2d) {
@@ -254,8 +255,8 @@ inline void project_cov3d_ewa_vjp(const float *cov3d, const float *viewmat, floa
     v_mean3d[2] += dot(v_t, W[2]);
 }
 
-// Gradient with respect to the stored (unnormalized) quaternion, normalization not
-// differentiated, as in the Metal kernel. v_R is column-major.
+// Gradient with respect to the stored (unnormalized) quaternion; quat_to_rotmat
+// normalizes it, so the result is tangent to the unit sphere. v_R is column-major.
 inline float4 quat_to_rotmat_vjp(float4 quat, const float3x3 &v_R) {
     float s = rsqrtf_(quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z);
     float w = quat.x * s, x = quat.y * s, y = quat.z * s, z = quat.w * s;
@@ -267,7 +268,10 @@ inline float4 quat_to_rotmat_vjp(float4 quat, const float3x3 &v_R) {
                       z * (v_R[1][2] + v_R[2][1]) + w * (v_R[2][0] - v_R[0][2]));
     v_quat.w = 2.f * (x * (v_R[0][2] + v_R[2][0]) + y * (v_R[1][2] + v_R[2][1]) -
                       2.f * z * (v_R[0][0] + v_R[1][1]) + w * (v_R[0][1] - v_R[1][0]));
-    return v_quat;
+    // through q / |q|: drop the radial component and scale by 1 / |q|
+    float radial = v_quat.x * w + v_quat.y * x + v_quat.z * y + v_quat.w * z;
+    return {(v_quat.x - radial * w) * s, (v_quat.y - radial * x) * s, (v_quat.z - radial * y) * s,
+            (v_quat.w - radial * z) * s};
 }
 
 inline void scale_rot_to_cov3d_vjp(float3 scale, float glob_scale, float4 quat, const float *v_cov3d,
@@ -668,10 +672,10 @@ void forward(Frame &f, int num_points, MTensor &means3d, MTensor &scales, float 
 namespace {
 
 // ── Loss: L1 + SSIM (ssim_h_fwd / ssim_fused_v_fwd_h_bwd / ssim_v_bwd) ──────
-// Zero-padded 11x11 Gaussian SSIM between the render (y) and the ground truth (x),
-// with the derivative fields of the fused Metal kernel: like it, the horizontal
-// backward convolution also sees the fields of the 5 columns beyond each image edge
-// (computed from zero statistics). Returns the summed per-pixel loss.
+// Zero-padded 11x11 Gaussian SSIM between the render (y) and the ground truth (x).
+// The derivative fields exist only where the loss does, inside the image: the
+// horizontal backward convolution reads zeros beyond the edges, as the vertical one
+// does. Returns the summed per-pixel loss.
 
 void ssim_h_fwd(const float *rendered, const float *gt, uint32_t W, uint32_t H, float *hbuf) {
     parallel_for(H, 8, [&](size_t b, size_t e) {
@@ -714,15 +718,17 @@ double ssim_fused_v_fwd_h_bwd(const float *rendered, const float *gt, const floa
             for (int c = 0; c < 3; c++) {
                 for (int xe = 0; xe < ext; xe++) {
                     const int xp = xe - SSIM_HALF_WIN;
+                    if (xp < 0 || xp >= (int)W) {
+                        f1[xe] = f2[xe] = f3[xe] = 0.f;
+                        continue;
+                    }
                     float s[5] = {0, 0, 0, 0, 0};
-                    if (xp >= 0 && xp < (int)W) {
-                        for (int k = 0; k < SSIM_WIN; k++) {
-                            int gy = (int)y - SSIM_HALF_WIN + k;
-                            if (gy < 0 || gy >= (int)H) continue;
-                            const float *h = hbuf + ((size_t)gy * W + xp) * 15 + c * 5;
-                            float w = GAUSS_1D[k];
-                            for (int q = 0; q < 5; q++) s[q] += w * h[q];
-                        }
+                    for (int k = 0; k < SSIM_WIN; k++) {
+                        int gy = (int)y - SSIM_HALF_WIN + k;
+                        if (gy < 0 || gy >= (int)H) continue;
+                        const float *h = hbuf + ((size_t)gy * W + xp) * 15 + c * 5;
+                        float w = GAUSS_1D[k];
+                        for (int q = 0; q < 5; q++) s[q] += w * h[q];
                     }
                     float mu_x = s[0], mu_y = s[1], sq_x = s[2], sq_y = s[3], cross = s[4];
                     float sigma_x_sq = sq_x - mu_x * mu_x, sigma_y_sq = sq_y - mu_y * mu_y;
@@ -735,11 +741,9 @@ double ssim_fused_v_fwd_h_bwd(const float *rendered, const float *gt, const floa
                     f1[xe] = dmu - 2.0f * mu_y * dsyq - mu_x * dsxy;
                     f2[xe] = 2.0f * dsyq;
                     f3[xe] = dsxy;
-                    if (xp >= 0 && xp < (int)W) {
-                        size_t i = ((size_t)y * W + xp) * 3 + c;
-                        ssim_pix[xp] += (A * B) / (Cd * D);
-                        l1_pix[xp] += std::fabs(gt[i] - rendered[i]);
-                    }
+                    size_t i = ((size_t)y * W + xp) * 3 + c;
+                    ssim_pix[xp] += (A * B) / (Cd * D);
+                    l1_pix[xp] += std::fabs(gt[i] - rendered[i]);
                 }
                 for (uint32_t x = 0; x < W; x++) {
                     float h1 = 0, h2 = 0, h3 = 0;

@@ -154,6 +154,17 @@ target_link_libraries(msplat PRIVATE
 target_compile_definitions(msplat PRIVATE USE_MPS)
 install(TARGETS msplat DESTINATION bin)
 
+# --- Tests (optional): gradient check of the training step against finite differences ---
+
+option(MSPLAT_BUILD_TESTS "Build the C++ gradient check (ctest)" OFF)
+
+if(MSPLAT_BUILD_TESTS)
+    enable_testing()
+    add_executable(msplat_gradcheck tests/gradcheck.cpp)
+    target_link_libraries(msplat_gradcheck PRIVATE msplat_core)
+    add_test(NAME gradcheck COMMAND msplat_gradcheck WORKING_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+endif()
+
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---
 
 option(MSPLAT_BUILD_PYTHON "Build nanobind Python bindings" OFF)
