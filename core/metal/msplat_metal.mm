@@ -179,6 +179,13 @@ struct MetalContext {
     id<MTLComputePipelineState> knn_box_bounds_kernel_cpso;
     id<MTLComputePipelineState> knn3_mean_dist_kernel_cpso;
     id<MTLComputePipelineState> init_gaussians_kernel_cpso;
+    // Image pipeline, metrics, display
+    id<MTLComputePipelineState> image_resize_area_kernel_cpso;
+    id<MTLComputePipelineState> image_undistort_kernel_cpso;
+    id<MTLComputePipelineState> eval_ssim_h_kernel_cpso;
+    id<MTLComputePipelineState> eval_ssim_v_kernel_cpso;
+    id<MTLComputePipelineState> pack_rgba8_kernel_cpso;
+    id<MTLComputePipelineState> depth_finalize_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -303,6 +310,13 @@ MetalContext* init_msplat_metal_context() {
     ctx->knn_box_bounds_kernel_cpso               = load(@"knn_box_bounds_kernel");
     ctx->knn3_mean_dist_kernel_cpso               = load(@"knn3_mean_dist_kernel");
     ctx->init_gaussians_kernel_cpso               = load(@"init_gaussians_kernel");
+    // Image pipeline, metrics, display
+    ctx->image_resize_area_kernel_cpso            = load(@"image_resize_area_kernel");
+    ctx->image_undistort_kernel_cpso              = load(@"image_undistort_kernel");
+    ctx->eval_ssim_h_kernel_cpso                  = load(@"eval_ssim_h_kernel");
+    ctx->eval_ssim_v_kernel_cpso                  = load(@"eval_ssim_v_kernel");
+    ctx->pack_rgba8_kernel_cpso                   = load(@"pack_rgba8_kernel");
+    ctx->depth_finalize_kernel_cpso               = load(@"depth_finalize_kernel");
 
     [metal_library release];
 
@@ -540,6 +554,9 @@ struct FusedTensorCache {
     // Bound in place of absent optional inputs: Metal needs a valid buffer at every
     // index a kernel declares, even one it never reads.
     MTensor dummy_tex, dummy_depth, dummy_aux, dummy_terms;
+
+    // Display packing and evaluation scratch, reused across calls
+    MTensor rgba8_out, eval_hbuf, eval_partials;
 
     void ensure_aux(int ih, int iw, id<MTLDevice> dev) {
         if (ih == aux_h && iw == aux_w && out_depth.defined()) return;
@@ -2088,8 +2105,9 @@ void msplat_radix_sort(MTensor &keys, MTensor &vals, uint32_t n, int key_bits) {
     std::vector<MTensor> levels = scan_levels(dev, hist_n);
     int passes = (std::min(key_bits, 64) + 7) / 8;
 
-    id<MTLBuffer> kb[2] = {keys.buffer(), keys_tmp.buffer()};
-    id<MTLBuffer> vb[2] = {vals.buffer(), vals_tmp.buffer()};
+    // std::array: blocks cannot capture C arrays
+    std::array<id<MTLBuffer>, 2> kb = {{keys.buffer(), keys_tmp.buffer()}};
+    std::array<id<MTLBuffer>, 2> vb = {{vals.buffer(), vals_tmp.buffer()}};
     id<MTLBuffer> hb = hist.buffer();
     std::vector<MTensor> *lv = &levels;
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -2146,7 +2164,7 @@ void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist) {
             lo[k] = std::min(lo[k], p[3 * i + k]);
             hi[k] = std::max(hi[k], p[3 * i + k]);
         }
-    float bounds[6];
+    std::array<float, 6> bounds;  // std::array: blocks cannot capture C arrays
     for (int k = 0; k < 3; k++) {
         bounds[k] = lo[k];
         float ext = hi[k] - lo[k];
@@ -2165,7 +2183,7 @@ void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist) {
         NSUInteger tpg = MIN(ctx->morton_codes_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
         [enc setComputePipelineState:ctx->morton_codes_kernel_cpso];
         ENC_BUF(enc, points, 0); ENC_SCALAR(enc, n, 1);
-        [enc setBytes:bounds length:sizeof(bounds) atIndex:2];
+        [enc setBytes:bounds.data() length:sizeof(float) * bounds.size() atIndex:2];
         ENC_BUF(enc, keys, 3); ENC_BUF(enc, order, 4);
         [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
@@ -2210,6 +2228,152 @@ void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t se
         ENC_BUF(enc, mean_dist, 0); ENC_BUF(enc, rgb, 1); ENC_SCALAR(enc, n, 2);
         ENC_SCALAR(enc, seed, 3); ENC_SCALAR(enc, opacity_logit, 4);
         ENC_BUF(enc, scales, 5); ENC_BUF(enc, quats, 6); ENC_BUF(enc, features_dc, 7); ENC_BUF(enc, opacities, 8);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+// ============================================================================
+// Image pipeline, evaluation metrics, display packing
+// ============================================================================
+
+// Must match UndistortParams in msplat_metal.metal.
+struct UndistortParamsGPU {
+    float fx, fy, cx, cy;
+    float k1, k2, p1, p2, k3;
+    uint32_t src_w, src_h, dst_w, dst_h, roi_x, roi_y, pad;
+};
+static_assert(sizeof(UndistortParamsGPU) == 64, "UndistortParamsGPU must match UndistortParams");
+
+static MTLSize grid2d_tg(id<MTLComputePipelineState> pso) {
+    NSUInteger w = 16, h = MIN((NSUInteger)16, pso.maxTotalThreadsPerThreadgroup / 16);
+    return MTLSizeMake(w, MAX((NSUInteger)1, h), 1);
+}
+
+void msplat_resize_area(const MTensor &src, bool src_is_u8, int sw, int sh, MTensor &dst, int dw, int dh) {
+    if (dw <= 0 || dh <= 0) return;
+    MetalContext* ctx = get_global_context();
+    g_tcache.ensure_dummies(ctx->device);
+    std::array<uint32_t, 4> dims = {{(uint32_t)sw, (uint32_t)sh, (uint32_t)dw, (uint32_t)dh}};
+    uint32_t is_u8 = src_is_u8 ? 1u : 0u;
+    id<MTLBuffer> u8 = src_is_u8 ? src.buffer() : g_tcache.dummy_aux.buffer();
+    id<MTLBuffer> f = src_is_u8 ? g_tcache.dummy_tex.buffer() : src.buffer();
+    id<MTLBuffer> out = dst.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->image_resize_area_kernel_cpso];
+        [enc setBuffer:u8 offset:0 atIndex:0];
+        [enc setBuffer:f offset:0 atIndex:1];
+        [enc setBytes:dims.data() length:sizeof(uint32_t) * dims.size() atIndex:2];
+        [enc setBytes:&is_u8 length:sizeof(is_u8) atIndex:3];
+        [enc setBuffer:out offset:0 atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(dw, dh, 1) threadsPerThreadgroup:grid2d_tg(ctx->image_resize_area_kernel_cpso)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_undistort(const MTensor &src, int sw, int sh, const float intr[4], const float dist[5],
+                      int roi_x, int roi_y, MTensor &dst, int dw, int dh) {
+    if (dw <= 0 || dh <= 0) return;
+    MetalContext* ctx = get_global_context();
+    UndistortParamsGPU p = {};
+    p.fx = intr[0]; p.fy = intr[1]; p.cx = intr[2]; p.cy = intr[3];
+    p.k1 = dist[0]; p.k2 = dist[1]; p.p1 = dist[2]; p.p2 = dist[3]; p.k3 = dist[4];
+    p.src_w = (uint32_t)sw; p.src_h = (uint32_t)sh; p.dst_w = (uint32_t)dw; p.dst_h = (uint32_t)dh;
+    p.roi_x = (uint32_t)roi_x; p.roi_y = (uint32_t)roi_y;
+    id<MTLBuffer> in = src.buffer(), out = dst.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->image_undistort_kernel_cpso];
+        [enc setBuffer:in offset:0 atIndex:0];
+        [enc setBytes:&p length:sizeof(p) atIndex:1];
+        [enc setBuffer:out offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(dw, dh, 1) threadsPerThreadgroup:grid2d_tg(ctx->image_undistort_kernel_cpso)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_image_metrics(const MTensor &rendered, const MTensor &gt, int h, int w, double out[3]) {
+    out[0] = out[1] = out[2] = 0.0;
+    if (h <= 0 || w <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    if (!g_tcache.eval_hbuf.defined() || g_tcache.eval_hbuf.numel() < (int64_t)h * w * 15)
+        g_tcache.eval_hbuf = mtensor_empty(dev, {(int64_t)h * w * 15}, DType::Float32);
+    MTLSize tg = MTLSizeMake(16, 16, 1);
+    require_threads(ctx->eval_ssim_v_kernel_cpso, 256, "eval_ssim_v_kernel");
+    uint32_t tgx = div_up((uint64_t)w, 16), tgy = div_up((uint64_t)h, 16);
+    if (!g_tcache.eval_partials.defined() || g_tcache.eval_partials.numel() < (int64_t)tgx * tgy * 3)
+        g_tcache.eval_partials = mtensor_empty(dev, {(int64_t)tgx * tgy * 3}, DType::Float32);
+    std::array<uint32_t, 2> size = {{(uint32_t)w, (uint32_t)h}};
+    id<MTLBuffer> a = rendered.buffer(), b = gt.buffer();
+    id<MTLBuffer> hbuf = g_tcache.eval_hbuf.buffer(), parts = g_tcache.eval_partials.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->eval_ssim_h_kernel_cpso];
+        [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1];
+        [enc setBytes:size.data() length:sizeof(uint32_t) * size.size() atIndex:2]; [enc setBuffer:hbuf offset:0 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:grid2d_tg(ctx->eval_ssim_h_kernel_cpso)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->eval_ssim_v_kernel_cpso];
+        [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1];
+        [enc setBuffer:hbuf offset:0 atIndex:2]; [enc setBytes:size.data() length:sizeof(uint32_t) * size.size() atIndex:3];
+        [enc setBuffer:parts offset:0 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(tgx, tgy, 1) threadsPerThreadgroup:tg];
+        [enc endEncoding];
+    });
+    msplat_gpu_sync();
+    const float *pp = g_tcache.eval_partials.data<float>();
+    double ssim = 0, l1 = 0, sq = 0;
+    for (uint32_t g = 0; g < tgx * tgy; g++) {
+        ssim += pp[3 * g];
+        l1 += pp[3 * g + 1];
+        sq += pp[3 * g + 2];
+    }
+    double count = (double)h * w * 3;
+    double mse = sq / count;
+    out[0] = mse > 0 ? 10.0 * std::log10(1.0 / mse) : INFINITY;
+    out[1] = ssim / count;
+    out[2] = l1 / count;
+}
+
+void msplat_pack_rgba8(const MTensor &img, uint32_t n, uint8_t *out) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    if (!g_tcache.rgba8_out.defined() || g_tcache.rgba8_out.numel() < (int64_t)n)
+        g_tcache.rgba8_out = mtensor_empty(ctx->device, {(int64_t)n}, DType::Int32);
+    id<MTLBuffer> in = img.buffer(), packed = g_tcache.rgba8_out.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->pack_rgba8_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->pack_rgba8_kernel_cpso];
+        [enc setBuffer:in offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBuffer:packed offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+    msplat_gpu_sync();
+    memcpy(out, g_tcache.rgba8_out.data_ptr(), (size_t)n * 4);
+}
+
+void msplat_finalize_depth(const MTensor &depth_num, const MTensor &final_T, uint32_t n, float inv_scale,
+                           MTensor &depth_out, MTensor &alpha_out) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLBuffer> d = depth_num.buffer(), t = final_T.buffer(), od = depth_out.buffer(), oa = alpha_out.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->depth_finalize_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->depth_finalize_kernel_cpso];
+        [enc setBuffer:d offset:0 atIndex:0]; [enc setBuffer:t offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2]; [enc setBytes:&inv_scale length:sizeof(inv_scale) atIndex:3];
+        [enc setBuffer:od offset:0 atIndex:4]; [enc setBuffer:oa offset:0 atIndex:5];
         [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         [enc endEncoding];
     });

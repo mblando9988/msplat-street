@@ -22,21 +22,15 @@ int numShBases(int degree){
 }
 
 // Metrics on CPU MTensor data
-float psnr(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double mse = 0;
-    for (int64_t i = 0; i < n; i++) { double d = r[i] - g[i]; mse += d * d; }
-    mse /= n;
-    return 10.0f * std::log10(1.0 / mse);
-}
-
-float l1_loss(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double sum = 0;
-    for (int64_t i = 0; i < n; i++) sum += std::abs(r[i] - g[i]);
-    return (float)(sum / n);
+ImageMetrics imageMetrics(const MTensor& rendered, const MTensor& gt) {
+    if (rendered.ndim() != 3 || gt.ndim() != 3 || rendered.size(2) != 3 || gt.size(2) != 3 ||
+        rendered.size(0) != gt.size(0) || rendered.size(1) != gt.size(1))
+        throw std::invalid_argument("imageMetrics: expected two (H, W, 3) images of equal size");
+    if (!rendered.isGpu() || !gt.isGpu())
+        throw std::invalid_argument("imageMetrics: images must be GPU tensors");
+    double m[3];
+    msplat_image_metrics(rendered, gt, (int)rendered.size(0), (int)rendered.size(1), m);
+    return {(float)m[0], (float)m[1], (float)m[2]};
 }
 
 // Model constructor
@@ -742,14 +736,16 @@ static void computeSkyFrame(const std::vector<Camera> &cams, float frame[9]) {
 // Initialize the sky texture from the sky-mask pixels of the training images, each
 // splatted to the texel its ray hits (same mapping as sky_uv in the shader). Texels no
 // image saw take the mean of their elevation row, or the nearest row that has data.
+// Reads the GPU-resident images through shared memory: sync first.
 static void initSkyTexture(const std::vector<Camera> &cams, const float frame[9], int W, int H, float *tex) {
     std::vector<double> sum((size_t)W * H * 3, 0.0), cnt((size_t)W * H, 0.0);
     double total[3] = {}, totalN = 0;
     for (auto &cam : cams) {
-        if (!cam.priorHasSky || cam.image.empty() || !cam.priorAux.defined()) continue;
+        if (!cam.priorHasSky || !cam.image.defined() || !cam.priorAux.defined()) continue;
         const uint8_t *aux = cam.priorAux.data<uint8_t>();
+        const float *img = cam.image.data<float>();
         const float *M = cam.camToWorld;
-        int iw = cam.image.width, ih = cam.image.height;
+        int iw = (int)cam.image.size(1), ih = (int)cam.image.size(0);
         int stride = std::max(1, std::max(iw, ih) / 256);
         for (int y = 0; y < ih; y += stride) {
             int qy = std::min(cam.priorH - 1, (int)((y + 0.5f) * cam.priorH / ih));
@@ -770,7 +766,7 @@ static void initSkyTexture(const std::vector<Camera> &cams, const float frame[9]
                 int v = (int)std::floor((0.5f - el / (float)M_PI) * H);
                 u = ((u % W) + W) % W;
                 v = std::clamp(v, 0, H - 1);
-                const float *c = &cam.image.data[3 * ((size_t)y * iw + x)];
+                const float *c = &img[3 * ((size_t)y * iw + x)];
                 size_t t = (size_t)v * W + u;
                 for (int k = 0; k < 3; k++) { sum[3 * t + k] += c[k]; total[k] += c[k]; }
                 cnt[t] += 1;
@@ -841,6 +837,7 @@ void Model::configurePriors(const PriorOptions &opts, std::vector<Camera> &train
             throw std::invalid_argument("sky texture must be at least 4x2");
         computeSkyFrame(trainCams, skyFrame);
         skyTex = gpu_empty({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
+        msplat_gpu_sync();  // images finish loading on the GPU
         initSkyTexture(trainCams, skyFrame, opts.skyWidth, opts.skyHeight, skyTex.data<float>());
         skyGrad = gpu_zeros({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
         skyExpAvg = gpu_zeros({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
@@ -873,18 +870,11 @@ void Model::renderDepth(Camera& cam, int step, MTensor &depthOut, MTensor &alpha
         opacities, backgroundColor, &p);
     MTensor d, t;
     msplat_render_aux_outputs(d, t);
+    depthOut = gpu_empty({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
+    alphaOut = gpu_empty({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
+    // normalized scene → dataset units
+    msplat_finalize_depth(d, t, (uint32_t)s.height * s.width, 1.f / scale, depthOut, alphaOut);
     msplat_gpu_sync();
-
-    int64_t n = (int64_t)s.height * s.width;
-    depthOut = MTensor({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
-    alphaOut = MTensor({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
-    const float *dp = d.data<float>(), *tp = t.data<float>();
-    float *od = depthOut.data<float>(), *oa = alphaOut.data<float>();
-    for (int64_t i = 0; i < n; i++) {
-        float a = 1.f - tp[i];
-        oa[i] = a;
-        od[i] = a > 1e-4f ? dp[i] / a / scale : 0.f;  // normalized scene → dataset units
-    }
 }
 
 void Model::lastPriorLosses(float out[3]) {

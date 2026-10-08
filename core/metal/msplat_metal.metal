@@ -4801,3 +4801,187 @@ kernel void init_gaussians_kernel(
         features_dc[3 * i + c] = ((float)rgb[3 * i + c] * (1.f / 255.f) - 0.5f) / SH_C0;
     opacities[i] = opacity_logit;
 }
+
+// ============================================================================
+// Image pipeline (GPU-resident datasets)
+// Images are decoded straight into GPU-visible RGBA8 memory; conversion,
+// resampling and undistortion happen here and only float GPU levels are kept.
+// ============================================================================
+
+// Area (box) resample into float RGB: each output pixel averages the source area it
+// covers, weighted by overlap, for any (also non-integer) scale; equal sizes copy. The
+// source is RGBA8 when src_is_u8, float RGB otherwise; the unused one is a dummy.
+kernel void image_resize_area_kernel(
+    device const uchar* src_u8          [[buffer(0)]],  // (sh, sw, 4)
+    device const float* src_f           [[buffer(1)]],  // (sh, sw, 3)
+    constant uint* dims                 [[buffer(2)]],  // sw, sh, dw, dh
+    constant uint& src_is_u8            [[buffer(3)]],
+    device float* dst                   [[buffer(4)]],  // (dh, dw, 3)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint sw = dims[0], sh = dims[1], dw = dims[2], dh = dims[3];
+    if (gid.x >= dw || gid.y >= dh) return;
+    const float scale_x = (float)sw / (float)dw, scale_y = (float)sh / (float)dh;
+    const float sy0 = (float)gid.y * scale_y, sy1 = (float)(gid.y + 1) * scale_y;
+    const float sx0 = (float)gid.x * scale_x, sx1 = (float)(gid.x + 1) * scale_x;
+    const int iy0 = (int)sy0, iy1 = min((int)ceil(sy1), (int)sh);
+    const int ix0 = (int)sx0, ix1 = min((int)ceil(sx1), (int)sw);
+    float3 sum = float3(0.f);
+    float area = 0.f;
+    for (int iy = iy0; iy < iy1; iy++) {
+        float wy = min((float)(iy + 1), sy1) - max((float)iy, sy0);
+        for (int ix = ix0; ix < ix1; ix++) {
+            float wx = min((float)(ix + 1), sx1) - max((float)ix, sx0);
+            uint s = (uint)iy * sw + (uint)ix;
+            float3 c = src_is_u8
+                ? float3((float)src_u8[4 * s], (float)src_u8[4 * s + 1], (float)src_u8[4 * s + 2]) * (1.f / 255.f)
+                : read_packed_float3(src_f, (int)s);
+            sum += (wx * wy) * c;
+            area += wx * wy;
+        }
+    }
+    write_packed_float3(dst, (int)(gid.y * dw + gid.x), sum / area);
+}
+
+// Must match UndistortParamsGPU in msplat_metal.mm.
+struct UndistortParams {
+    float fx, fy, cx, cy;
+    float k1, k2, p1, p2, k3;
+    uint src_w, src_h, dst_w, dst_h, roi_x, roi_y, pad;
+};
+
+// Brown-Conrady undistortion of the crop [roi, roi + dst) of the undistorted image
+// (same focal lengths): forward-distort each output pixel and bilinearly sample the
+// source, clamped to its border. The crop comes from undistortROI on the host.
+kernel void image_undistort_kernel(
+    device const float* src             [[buffer(0)]],  // (src_h, src_w, 3)
+    constant UndistortParams& p         [[buffer(1)]],
+    device float* dst                   [[buffer(2)]],  // (dst_h, dst_w, 3)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= p.dst_w || gid.y >= p.dst_h) return;
+    float x = ((float)(gid.x + p.roi_x) - p.cx) / p.fx;
+    float y = ((float)(gid.y + p.roi_y) - p.cy) / p.fy;
+    float r2 = x * x + y * y;
+    float radial = 1.f + p.k1 * r2 + p.k2 * r2 * r2 + p.k3 * r2 * r2 * r2;
+    float xd = x * radial + 2.f * p.p1 * x * y + p.p2 * (r2 + 2.f * x * x);
+    float yd = y * radial + p.p1 * (r2 + 2.f * y * y) + 2.f * p.p2 * x * y;
+    float sx = xd * p.fx + p.cx, sy = yd * p.fy + p.cy;
+
+    int x0 = (int)floor(sx), y0 = (int)floor(sy);
+    float fx = sx - floor(sx), fy = sy - floor(sy);
+    int xa = clamp(x0, 0, (int)p.src_w - 1), xb = clamp(x0 + 1, 0, (int)p.src_w - 1);
+    int ya = clamp(y0, 0, (int)p.src_h - 1), yb = clamp(y0 + 1, 0, (int)p.src_h - 1);
+    float3 c00 = read_packed_float3(src, ya * (int)p.src_w + xa), c10 = read_packed_float3(src, ya * (int)p.src_w + xb);
+    float3 c01 = read_packed_float3(src, yb * (int)p.src_w + xa), c11 = read_packed_float3(src, yb * (int)p.src_w + xb);
+    float3 top = c00 * (1.f - fx) + c10 * fx;
+    float3 bottom = c01 * (1.f - fx) + c11 * fx;
+    write_packed_float3(dst, (int)(gid.y * p.dst_w + gid.x), top * (1.f - fy) + bottom * fy);
+}
+
+// ── Evaluation metrics ──
+// Evaluation SSIM, same definition as the former CPU evaluator (11-tap Gaussian,
+// sigma 1.5, clamp-to-edge borders) so reported numbers stay comparable across
+// versions; the training SSIM kernels zero-pad instead.
+
+kernel void eval_ssim_h_kernel(
+    device const float* a               [[buffer(0)]],  // (H, W, 3) render
+    device const float* b               [[buffer(1)]],  // (H, W, 3) ground truth
+    constant uint2& size                [[buffer(2)]],  // (W, H)
+    device float* hbuf                  [[buffer(3)]],  // (H, W, 15)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint W = size.x, H = size.y;
+    if (gid.x >= W || gid.y >= H) return;
+    for (uint c = 0; c < 3; c++) {
+        float s[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int k = 0; k < SSIM_WIN; k++) {
+            int sx = clamp((int)gid.x + k - SSIM_HALF_WIN, 0, (int)W - 1);
+            uint i = (gid.y * W + (uint)sx) * 3 + c;
+            float w = GAUSS_1D[k], x = a[i], y = b[i];
+            s[0] += w * x; s[1] += w * y; s[2] += w * x * x; s[3] += w * y * y; s[4] += w * x * y;
+        }
+        uint o = (gid.y * W + gid.x) * 15 + c * 5;
+        for (uint f = 0; f < 5; f++) hbuf[o + f] = s[f];
+    }
+}
+
+// Vertical pass + per-pixel SSIM, absolute and squared error, reduced to one partial
+// sum triple per threadgroup (summed in double precision on the host).
+kernel void eval_ssim_v_kernel(
+    device const float* a               [[buffer(0)]],
+    device const float* b               [[buffer(1)]],
+    device const float* hbuf            [[buffer(2)]],
+    constant uint2& size                [[buffer(3)]],
+    device float* partials              [[buffer(4)]],  // (num_threadgroups, 3): ssim, l1, sq
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tg_count [[threadgroups_per_grid]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    const uint W = size.x, H = size.y;
+    float ssim = 0.f, l1 = 0.f, sq = 0.f;
+    if (gid.x < W && gid.y < H) {
+        for (uint c = 0; c < 3; c++) {
+            float s[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int k = 0; k < SSIM_WIN; k++) {
+                int sy = clamp((int)gid.y + k - SSIM_HALF_WIN, 0, (int)H - 1);
+                uint o = ((uint)sy * W + gid.x) * 15 + c * 5;
+                float w = GAUSS_1D[k];
+                for (uint f = 0; f < 5; f++) s[f] += w * hbuf[o + f];
+            }
+            float m12 = s[0] * s[1], m1sq = s[0] * s[0], m2sq = s[1] * s[1];
+            float num = (2.f * m12 + SSIM_C1) * (2.f * (s[4] - m12) + SSIM_C2);
+            float den = (m1sq + m2sq + SSIM_C1) * ((s[2] - m1sq) + (s[3] - m2sq) + SSIM_C2);
+            ssim += num / den;
+            uint i = (gid.y * W + gid.x) * 3 + c;
+            float d = a[i] - b[i];
+            l1 += fabs(d);
+            sq += d * d;
+        }
+    }
+    threadgroup float part[3][32];
+    ssim = simd_sum(ssim); l1 = simd_sum(l1); sq = simd_sum(sq);
+    if (lane == 0) { part[0][sg] = ssim; part[1][sg] = l1; part[2][sg] = sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tr == 0) {
+        uint n_sg = (tg_size.x * tg_size.y + simd_width - 1) / simd_width;
+        float t0 = 0.f, t1 = 0.f, t2 = 0.f;
+        for (uint k = 0; k < n_sg; k++) { t0 += part[0][k]; t1 += part[1][k]; t2 += part[2][k]; }
+        uint g = tgid.y * tg_count.x + tgid.x;
+        partials[3 * g] = t0; partials[3 * g + 1] = t1; partials[3 * g + 2] = t2;
+    }
+}
+
+// Display packing: float RGB → RGBA8 (clamped, truncated), one 32-bit store per
+// pixel; little-endian, so bytes land as R, G, B, A.
+kernel void pack_rgba8_kernel(
+    device const float* img             [[buffer(0)]],  // (n, 3)
+    constant uint& n                    [[buffer(1)]],
+    device uint* out                    [[buffer(2)]],  // (n,) RGBA8
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float3 c = saturate(read_packed_float3(img, (int)i)) * 255.f;
+    out[i] = (uint)c.x | ((uint)c.y << 8) | ((uint)c.z << 16) | (255u << 24);
+}
+
+// Expected depth (dataset units) and accumulated alpha from the aux render outputs.
+kernel void depth_finalize_kernel(
+    device const float* depth_num       [[buffer(0)]],  // sum_i w_i z_i
+    device const float* final_T         [[buffer(1)]],
+    constant uint& n                    [[buffer(2)]],
+    constant float& inv_scale           [[buffer(3)]],  // normalized scene → dataset units
+    device float* depth_out             [[buffer(4)]],
+    device float* alpha_out             [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float a = 1.f - final_T[i];
+    alpha_out[i] = a;
+    depth_out[i] = a > 1e-4f ? depth_num[i] / a * inv_scale : 0.f;
+}

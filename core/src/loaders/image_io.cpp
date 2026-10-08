@@ -1,4 +1,5 @@
 #include "loaders.hpp"
+#include "bindings.h"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -54,6 +55,47 @@ Image imreadRGB(const std::string &path) {
     return img;
 }
 
+// Decode into GPU-visible memory: CoreGraphics draws straight into the shared MTLBuffer,
+// so no CPU-side float image ever exists. Safe to call from several threads once the
+// Metal context exists (allocation only; nothing is encoded).
+RGBA8Image imreadRGBA8(const std::string &path) {
+    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
+    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
+    CFRelease(cfPath);
+
+    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
+    CFRelease(url);
+    if (!source) {
+        throw std::runtime_error("Failed to load image: " + path);
+    }
+
+    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
+    CFRelease(source);
+    if (!cgImage) {
+        throw std::runtime_error("Failed to decode image: " + path);
+    }
+
+    RGBA8Image img;
+    img.width = (int)CGImageGetWidth(cgImage);
+    img.height = (int)CGImageGetHeight(cgImage);
+    img.rgba = gpu_empty({img.height, img.width, 4}, DType::UInt8);
+
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    CGContextRef ctx = CGBitmapContextCreate(
+        img.rgba.data_ptr(), img.width, img.height, 8, (size_t)img.width * 4, colorSpace,
+        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault
+    );
+    CGColorSpaceRelease(colorSpace);
+    if (!ctx) {
+        CGImageRelease(cgImage);
+        throw std::runtime_error("Failed to decode image: " + path);
+    }
+    CGContextDrawImage(ctx, CGRectMake(0, 0, img.width, img.height), cgImage);
+    CGContextRelease(ctx);
+    CGImageRelease(cgImage);
+    return img;
+}
+
 // ── Image writing (CoreGraphics PNG) ─────────────────────────────────────────
 
 void imwriteRGB(const std::string &path, const Image &img) {
@@ -88,70 +130,8 @@ void imwriteRGB(const std::string &path, const Image &img) {
     CGImageRelease(cgImage);
 }
 
-// ── Area-based image resize (box filter) ─────────────────────────────────────
-
-Image resizeArea(const Image &src, int dstW, int dstH) {
-    Image dst;
-    dst.width = dstW;
-    dst.height = dstH;
-    dst.data.resize(dstW * dstH * 3, 0.0f);
-
-    float scaleX = (float)src.width / dstW;
-    float scaleY = (float)src.height / dstH;
-
-    for (int dy = 0; dy < dstH; dy++) {
-        float srcY0 = dy * scaleY;
-        float srcY1 = (dy + 1) * scaleY;
-
-        for (int dx = 0; dx < dstW; dx++) {
-            float srcX0 = dx * scaleX;
-            float srcX1 = (dx + 1) * scaleX;
-
-            float sum[3] = {};
-            float totalArea = 0;
-
-            int iy0 = (int)srcY0;
-            int iy1 = std::min((int)std::ceil(srcY1), src.height);
-            int ix0 = (int)srcX0;
-            int ix1 = std::min((int)std::ceil(srcX1), src.width);
-
-            for (int iy = iy0; iy < iy1; iy++) {
-                float wy = std::min((float)(iy + 1), srcY1) - std::max((float)iy, srcY0);
-                for (int ix = ix0; ix < ix1; ix++) {
-                    float wx = std::min((float)(ix + 1), srcX1) - std::max((float)ix, srcX0);
-                    float area = wx * wy;
-                    const float *p = &src.data[(iy * src.width + ix) * 3];
-                    sum[0] += p[0] * area;
-                    sum[1] += p[1] * area;
-                    sum[2] += p[2] * area;
-                    totalArea += area;
-                }
-            }
-
-            float *out = &dst.data[(dy * dstW + dx) * 3];
-            float inv = 1.0f / totalArea;
-            out[0] = sum[0] * inv;
-            out[1] = sum[1] * inv;
-            out[2] = sum[2] * inv;
-        }
-    }
-    return dst;
-}
-
-// ── Undistortion (Brown-Conrady model) ───────────────────────────────────────
-
-// Apply forward distortion: normalized undistorted → normalized distorted
-static void distortPoint(float x, float y,
-    float k1, float k2, float p1, float p2, float k3,
-    float &xd, float &yd)
-{
-    float r2 = x * x + y * y;
-    float r4 = r2 * r2;
-    float r6 = r4 * r2;
-    float radial = 1.0f + k1 * r2 + k2 * r4 + k3 * r6;
-    xd = x * radial + 2.0f * p1 * x * y + p2 * (r2 + 2.0f * x * x);
-    yd = y * radial + p1 * (r2 + 2.0f * y * y) + 2.0f * p2 * x * y;
-}
+// ── Undistortion crop (Brown-Conrady model) ──────────────────────────────────
+// The remap itself runs on the GPU (image_undistort_kernel); only the crop is found here.
 
 // Iteratively invert distortion: normalized distorted → normalized undistorted
 static void undistortPoint(float xd, float yd,
@@ -172,152 +152,40 @@ static void undistortPoint(float xd, float yd,
     }
 }
 
-// Bilinear sample from float32 image, returns pixel value at (x, y)
-static void bilinearSample(const Image &img, float x, float y, float out[3]) {
-    int x0 = (int)std::floor(x);
-    int y0 = (int)std::floor(y);
-    int x1 = x0 + 1;
-    int y1 = y0 + 1;
-
-    // Clamp to image bounds
-    x0 = std::clamp(x0, 0, img.width - 1);
-    x1 = std::clamp(x1, 0, img.width - 1);
-    y0 = std::clamp(y0, 0, img.height - 1);
-    y1 = std::clamp(y1, 0, img.height - 1);
-
-    float fx = x - std::floor(x);
-    float fy = y - std::floor(y);
-
-    const float *p00 = &img.data[(y0 * img.width + x0) * 3];
-    const float *p10 = &img.data[(y0 * img.width + x1) * 3];
-    const float *p01 = &img.data[(y1 * img.width + x0) * 3];
-    const float *p11 = &img.data[(y1 * img.width + x1) * 3];
-
-    for (int c = 0; c < 3; c++) {
-        float top    = p00[c] * (1.0f - fx) + p10[c] * fx;
-        float bottom = p01[c] * (1.0f - fx) + p11[c] * fx;
-        out[c] = top * (1.0f - fy) + bottom * fy;
-    }
-}
-
-UndistortResult undistortImage(const Image &src,
+UndistortROI undistortROI(int w, int h,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3)
 {
-    int w = src.width, h = src.height;
-
-    // Find valid region by undistorting boundary points of the source image.
-    // For each point on the distorted boundary, find its undistorted position.
-    // The inner rectangle of all undistorted boundary points = valid region (alpha=0).
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    int nSamples = 200;
-    for (int i = 0; i < nSamples; i++) {
-        float t = (float)i / (nSamples - 1);
-        // Four edges of the distorted image
-        float edges[][2] = {
-            {t * w, 0.0f},          // top
-            {t * w, (float)(h-1)},  // bottom
-            {0.0f, t * h},          // left
-            {(float)(w-1), t * h},  // right
-        };
-        for (auto &pt : edges) {
-            float xd = (pt[0] - cx) / fx;
-            float yd = (pt[1] - cy) / fy;
-            float xu, yu;
-            undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-            // Back to pixel coords using original intrinsics as the "new" camera
-            float pu = xu * fx + cx;
-            float pv = yu * fy + cy;
-            minX = std::min(minX, pu);
-            maxX = std::max(maxX, pu);
-            minY = std::min(minY, pv);
-            maxY = std::max(maxY, pv);
-        }
-    }
-
-    // Inner rectangle: clamp to image bounds and take the inner edges
-    // For top/left edges: take the max (inner boundary)
-    // For bottom/right edges: take the min (inner boundary)
-    // But we need to separate inner from outer per edge...
-    // Top edge gives us maxY from top → that's minY constraint
-    // Bottom edge gives us minY from bottom → that's maxY constraint
-    // Actually, let me resample per-edge:
+    // Undistort the boundary of the distorted image; the innermost position of each
+    // edge bounds the region every output pixel of which has a source pixel (alpha=0).
+    const int nSamples = 200;
     float topMax = -1e9f, bottomMin = 1e9f, leftMax = -1e9f, rightMin = 1e9f;
     for (int i = 0; i < nSamples; i++) {
         float t = (float)i / (nSamples - 1);
+        float xu, yu;
 
         // Top edge: all points along y=0
-        float xd = (t * w - cx) / fx, yd = (0.0f - cy) / fy;
-        float xu, yu;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        undistortPoint((t * w - cx) / fx, (0.0f - cy) / fy, k1, k2, p1, p2, k3, xu, yu);
         topMax = std::max(topMax, yu * fy + cy);
 
         // Bottom edge: all points along y=h-1
-        xd = (t * w - cx) / fx; yd = ((float)(h-1) - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        undistortPoint((t * w - cx) / fx, ((float)(h-1) - cy) / fy, k1, k2, p1, p2, k3, xu, yu);
         bottomMin = std::min(bottomMin, yu * fy + cy);
 
         // Left edge: all points along x=0
-        xd = (0.0f - cx) / fx; yd = (t * h - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        undistortPoint((0.0f - cx) / fx, (t * h - cy) / fy, k1, k2, p1, p2, k3, xu, yu);
         leftMax = std::max(leftMax, xu * fx + cx);
 
         // Right edge: all points along x=w-1
-        xd = ((float)(w-1) - cx) / fx; yd = (t * h - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        undistortPoint(((float)(w-1) - cx) / fx, (t * h - cy) / fy, k1, k2, p1, p2, k3, xu, yu);
         rightMin = std::min(rightMin, xu * fx + cx);
     }
 
-    // Inner rectangle (alpha=0: no black borders)
-    int roiX = std::max(0, (int)std::ceil(leftMax));
-    int roiY = std::max(0, (int)std::ceil(topMax));
-    int roiW = std::min(w, (int)std::floor(rightMin)) - roiX;
-    int roiH = std::min(h, (int)std::floor(bottomMin)) - roiY;
-    if (roiW <= 0 || roiH <= 0) { roiX = 0; roiY = 0; roiW = w; roiH = h; }
-
-    // Undistort: for each pixel in the output (undistorted) image,
-    // apply forward distortion to find source pixel in distorted input
-    Image undist;
-    undist.width = w;
-    undist.height = h;
-    undist.data.resize(w * h * 3);
-
-    for (int oy = 0; oy < h; oy++) {
-        for (int ox = 0; ox < w; ox++) {
-            float x = ((float)ox - cx) / fx;
-            float y = ((float)oy - cy) / fy;
-            float xd_n, yd_n;
-            distortPoint(x, y, k1, k2, p1, p2, k3, xd_n, yd_n);
-            float srcX = xd_n * fx + cx;
-            float srcY = yd_n * fy + cy;
-
-            float pixel[3];
-            bilinearSample(src, srcX, srcY, pixel);
-            float *out = &undist.data[(oy * w + ox) * 3];
-            out[0] = pixel[0];
-            out[1] = pixel[1];
-            out[2] = pixel[2];
-        }
-    }
-
-    // Crop to ROI
-    Image cropped;
-    cropped.width = roiW;
-    cropped.height = roiH;
-    cropped.data.resize(roiW * roiH * 3);
-    for (int y = 0; y < roiH; y++) {
-        memcpy(&cropped.data[y * roiW * 3],
-               &undist.data[((y + roiY) * w + roiX) * 3],
-               roiW * 3 * sizeof(float));
-    }
-
-    UndistortResult result;
-    result.image = std::move(cropped);
-    result.fx = fx;
-    result.fy = fy;
-    result.cx = cx - roiX;
-    result.cy = cy - roiY;
-    result.width = roiW;
-    result.height = roiH;
-    return result;
+    UndistortROI roi;
+    roi.x = std::max(0, (int)std::ceil(leftMax));
+    roi.y = std::max(0, (int)std::ceil(topMax));
+    roi.width = std::min(w, (int)std::floor(rightMin)) - roi.x;
+    roi.height = std::min(h, (int)std::floor(bottomMin)) - roi.y;
+    if (roi.width <= 0 || roi.height <= 0) { roi.x = 0; roi.y = 0; roi.width = w; roi.height = h; }
+    return roi;
 }

@@ -155,4 +155,28 @@ void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist);
 void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t seed, float opacity_logit,
                            MTensor &scales, MTensor &quats, MTensor &features_dc, MTensor &opacities);
 
+// ── Image pipeline, metrics, display ──
+// All encoded into the in-flight command buffer; only the metrics and RGBA8 packing sync.
+
+// Area (box) resample to (dh, dw, 3) float RGB. src is (sh, sw, 4) RGBA8 when src_is_u8,
+// else (sh, sw, 3) float RGB; equal sizes convert without resampling.
+void msplat_resize_area(const MTensor &src, bool src_is_u8, int sw, int sh, MTensor &dst, int dw, int dh);
+
+// Brown-Conrady undistortion of (sh, sw, 3) float RGB into the (dh, dw, 3) crop at
+// (roi_x, roi_y) of the undistorted image. intr = fx, fy, cx, cy; dist = k1, k2, p1, p2, k3.
+void msplat_undistort(const MTensor &src, int sw, int sh, const float intr[4], const float dist[5],
+                      int roi_x, int roi_y, MTensor &dst, int dw, int dh);
+
+// PSNR, SSIM (11-tap Gaussian, clamp-to-edge borders) and L1 of two (h, w, 3) images,
+// written to out in that order. Syncs.
+void msplat_image_metrics(const MTensor &rendered, const MTensor &gt, int h, int w, double out[3]);
+
+// Float RGB (n, 3) to RGBA8 (n, 4) for display, written to out. Syncs.
+void msplat_pack_rgba8(const MTensor &img, uint32_t n, uint8_t *out);
+
+// Expected depth (depth_num / alpha * inv_scale, 0 where alpha <= 1e-4) and alpha from
+// the aux render outputs (see msplat_render_aux_outputs).
+void msplat_finalize_depth(const MTensor &depth_num, const MTensor &final_T, uint32_t n, float inv_scale,
+                           MTensor &depth_out, MTensor &alpha_out);
+
 #endif

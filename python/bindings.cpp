@@ -7,8 +7,8 @@
 
 #include "model.hpp"
 #include "input_data.hpp"
+#include "loaders.hpp"
 #include "msplat.hpp"
-#include "ssim.hpp"
 #include "priors.hpp"
 
 #include <filesystem>
@@ -91,6 +91,37 @@ struct TrainingStats {
     float ms_per_step;
 };
 
+// ── numpy conversion ────────────────────────────────────────────────────────
+
+// (H, W, 3) float image in shared memory → numpy copy (sync first)
+static nb::object to_numpy_rgb(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    float *buf = new float[h * w * 3];
+    memcpy(buf, t.data_ptr(), h * w * 3 * sizeof(float));
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+    size_t shape[3] = {h, w, 3};
+    return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+}
+
+// (H, W, 3) float image on the GPU → numpy (H, W, 4) uint8 RGBA, packed on the GPU
+static nb::object to_numpy_rgba8(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    uint8_t *buf = new uint8_t[std::max<size_t>(h * w * 4, 1)];
+    msplat_pack_rgba8(t, (uint32_t)(h * w), buf);
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<uint8_t*>(p); });
+    size_t shape[3] = {h, w, 4};
+    return nb::cast(nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, deleter));
+}
+
+static nb::object to_numpy_2d(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    float *buf = new float[h * w];
+    memcpy(buf, t.data_ptr(), h * w * sizeof(float));
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+    size_t shape[2] = {h, w};
+    return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
+}
+
 // ── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -105,10 +136,8 @@ public:
         data = inputDataFromX(path);
         if (!prior_dir.empty()) attachPriors(data, prior_dir);
 
-        // Load images (parallel)
-        for (auto &cam : data.cameras) {
-            cam.loadImage(downscale_factor);
-        }
+        // Parallel decode; conversion, resampling and undistortion on the GPU
+        loadCameraImages(data.cameras, downscale_factor);
 
         if (eval_mode) {
             auto split = data.splitTrainTest(test_every);
@@ -136,6 +165,15 @@ public:
         nb::dict d;
         d["any"] = any; d["depth"] = depth; d["confidence"] = conf; d["sky"] = sky; d["mask"] = mask;
         return d;
+    }
+
+    // Loaded ground-truth image → numpy (H, W, 3) float32, RGB [0, 1]
+    nb::object image(int index, bool use_test) {
+        auto &cams = use_test ? test_cams : train_cams;
+        if (index < 0 || index >= (int)cams.size())
+            throw std::runtime_error("Camera index out of range");
+        msplat_gpu_sync();  // loading finishes on the GPU
+        return to_numpy_rgb(cams[index].getGPUImage(1));
     }
 
     // Get camera-to-world pose (4x4 row-major) as numpy array
@@ -239,19 +277,15 @@ public:
 
         double sum_psnr = 0, sum_ssim = 0, sum_l1 = 0;
         int n = dataset_ptr->test_cams.size();
+        int ds = model->getDownscaleFactor(config.iterations);
 
         for (int i = 0; i < n; i++) {
             Camera &cam = dataset_ptr->test_cams[i];
             MTensor rgb = model->render(cam, config.iterations);
-            msplat_gpu_sync();
-
-            MTensor rgb_cpu = rgb.cpu();
-            int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = cam.getGPUImage(ds).cpu();
-
-            sum_psnr += psnr(rgb_cpu, gt_cpu);
-            sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
-            sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+            ImageMetrics m = imageMetrics(rgb, cam.getGPUImage(ds));
+            sum_psnr += m.psnr;
+            sum_ssim += m.ssim;
+            sum_l1 += m.l1;
         }
 
         nb::dict result;
@@ -270,25 +304,21 @@ public:
             throw std::runtime_error("Camera index out of range");
         }
 
-        Camera &cam = cams[cam_idx];
-        MTensor rgb = model->render(cam, current_step);
+        MTensor rgb = model->render(cams[cam_idx], current_step);
         msplat_gpu_sync();
-        MTensor rgb_cpu = rgb.cpu();
-
-        int h = rgb_cpu.size(0);
-        int w = rgb_cpu.size(1);
-
-        // Copy to numpy-owned buffer
-        float *buf = new float[h * w * 3];
-        memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
-
-        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
-        size_t shape[3] = {(size_t)h, (size_t)w, 3};
-        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+        return to_numpy_rgb(rgb);
     }
 
-    // Render from arbitrary pose → numpy (H, W, 3) float32
-    nb::object render_from_pose(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+    // Render a camera view → numpy (H, W, 4) uint8 RGBA, packed on the GPU (for display)
+    nb::object render_rgba8(int cam_idx, bool use_test) {
+        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size()) {
+            throw std::runtime_error("Camera index out of range");
+        }
+        return to_numpy_rgba8(model->render(cams[cam_idx], current_step));
+    }
+
+    Camera pose_camera(const nb::ndarray<nb::numpy, float> &cam_to_world, int ref_cam_idx) {
         if (cam_to_world.size() != 16)
             throw std::runtime_error("cam_to_world must have 16 elements (4x4 matrix)");
         if (ref_cam_idx < 0 || ref_cam_idx >= (int)dataset_ptr->train_cams.size())
@@ -298,19 +328,21 @@ public:
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
         cam.cachedViewMat = MTensor();
         cam.cachedProjViewMat = MTensor();
+        return cam;
+    }
 
+    // Render from arbitrary pose → numpy (H, W, 3) float32
+    nb::object render_from_pose(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+        Camera cam = pose_camera(cam_to_world, ref_cam_idx);
         MTensor rgb = model->render(cam, current_step);
         msplat_gpu_sync();
-        MTensor rgb_cpu = rgb.cpu();
+        return to_numpy_rgb(rgb);
+    }
 
-        int h = rgb_cpu.size(0);
-        int w = rgb_cpu.size(1);
-        float *buf = new float[h * w * 3];
-        memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
-
-        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
-        size_t shape[3] = {(size_t)h, (size_t)w, 3};
-        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    // Render from arbitrary pose → numpy (H, W, 4) uint8 RGBA, packed on the GPU
+    nb::object render_from_pose_rgba8(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+        Camera cam = pose_camera(cam_to_world, ref_cam_idx);
+        return to_numpy_rgba8(model->render(cam, current_step));
     }
 
     void export_ply(const std::string &path) {
@@ -355,15 +387,6 @@ public:
 
     void export_sky(const std::string &path) {
         model->saveSky(path);
-    }
-
-    static nb::object to_numpy_2d(const MTensor &t) {
-        size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
-        float *buf = new float[h * w];
-        memcpy(buf, t.data_ptr(), h * w * sizeof(float));
-        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
-        size_t shape[2] = {h, w};
-        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
     }
 };
 
@@ -531,6 +554,8 @@ NB_MODULE(_core, m) {
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,
             "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.")
+        .def("image", &Dataset::image, "index"_a, "use_test"_a = false,
+            "Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32.")
         .def("prior_counts", &Dataset::prior_counts,
             "Number of training cameras with each kind of prior file attached.");
 
@@ -554,6 +579,12 @@ NB_MODULE(_core, m) {
             "cam_to_world"_a, "ref_cam_idx"_a = 0,
             "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"
             "Uses intrinsics from ref_cam_idx. Returns numpy (H, W, 3) float32.")
+        .def("render_rgba8", &GaussianTrainer::render_rgba8,
+            "cam_idx"_a, "use_test"_a = false,
+            "Render a camera view for display. Returns numpy (H, W, 4) uint8 RGBA, packed on the GPU.")
+        .def("render_from_pose_rgba8", &GaussianTrainer::render_from_pose_rgba8,
+            "cam_to_world"_a, "ref_cam_idx"_a = 0,
+            "Like render_from_pose, but returns numpy (H, W, 4) uint8 RGBA packed on the GPU.")
         .def("export_ply", &GaussianTrainer::export_ply, "path"_a,
             "Export the current Gaussians as a PLY file.")
         .def("export_splat", &GaussianTrainer::export_splat, "path"_a,
@@ -611,6 +642,54 @@ NB_MODULE(_core, m) {
         size_t shape[1] = {n};
         return nb::ndarray<nb::numpy, float>(out, 1, shape, del);
     }, "points"_a, "Exact mean distance to the 3 nearest other points, computed on the GPU.");
+
+    m.def("_gpu_resize_area", [](nb::ndarray<nb::ndim<3>, nb::c_contig, nb::device::cpu> img,
+                                 int out_w, int out_h) {
+        size_t h = img.shape(0), w = img.shape(1), c = img.shape(2);
+        bool u8 = img.dtype() == nb::dtype<uint8_t>() && c == 4;
+        if (!u8 && !(img.dtype() == nb::dtype<float>() && c == 3))
+            throw std::invalid_argument("img must be (H, W, 4) uint8 or (H, W, 3) float32");
+        if (out_w < 1 || out_h < 1) throw std::invalid_argument("output size must be positive");
+        MTensor src = gpu_empty({(int64_t)h, (int64_t)w, (int64_t)c}, u8 ? DType::UInt8 : DType::Float32);
+        memcpy(src.data_ptr(), img.data(), src.nbytes());
+        MTensor dst = gpu_empty({out_h, out_w, 3}, DType::Float32);
+        msplat_resize_area(src, u8, (int)w, (int)h, dst, out_w, out_h);
+        msplat_gpu_sync();
+        return to_numpy_rgb(dst);
+    }, "img"_a, "out_w"_a, "out_h"_a,
+       "Area resample on the GPU: (H, W, 4) uint8 or (H, W, 3) float32 → (out_h, out_w, 3) float32.");
+    m.def("_gpu_undistort", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> img,
+                               std::vector<float> intrinsics, std::vector<float> distortion) {
+        if (intrinsics.size() != 4 || distortion.size() != 5)
+            throw std::invalid_argument("intrinsics = [fx, fy, cx, cy], distortion = [k1, k2, p1, p2, k3]");
+        int h = (int)img.shape(0), w = (int)img.shape(1);
+        const float *k = intrinsics.data(), *d = distortion.data();
+        UndistortROI roi = undistortROI(w, h, k[0], k[1], k[2], k[3], d[0], d[1], d[2], d[3], d[4]);
+        MTensor src = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(src.data_ptr(), img.data(), src.nbytes());
+        MTensor dst = gpu_empty({roi.height, roi.width, 3}, DType::Float32);
+        msplat_undistort(src, w, h, k, d, roi.x, roi.y, dst, roi.width, roi.height);
+        msplat_gpu_sync();
+        return nb::make_tuple(to_numpy_rgb(dst), roi.x, roi.y);
+    }, "img"_a, "intrinsics"_a, "distortion"_a,
+       "Undistort on the GPU into the alpha=0 crop. Returns (image, roi_x, roi_y).");
+    m.def("_gpu_image_metrics", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> rendered,
+                                   nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> gt) {
+        if (rendered.shape(0) != gt.shape(0) || rendered.shape(1) != gt.shape(1))
+            throw std::invalid_argument("images must have the same size");
+        int64_t h = (int64_t)rendered.shape(0), w = (int64_t)rendered.shape(1);
+        MTensor a = gpu_empty({h, w, 3}, DType::Float32), b = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(a.data_ptr(), rendered.data(), a.nbytes());
+        memcpy(b.data_ptr(), gt.data(), b.nbytes());
+        ImageMetrics m = imageMetrics(a, b);
+        return nb::make_tuple(m.psnr, m.ssim, m.l1);
+    }, "rendered"_a, "gt"_a, "GPU (psnr, ssim, l1) of two (H, W, 3) float32 images.");
+    m.def("_gpu_pack_rgba8", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> img) {
+        int64_t h = (int64_t)img.shape(0), w = (int64_t)img.shape(1);
+        MTensor t = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(t.data_ptr(), img.data(), t.nbytes());
+        return to_numpy_rgba8(t);
+    }, "img"_a, "Pack (H, W, 3) float32 into (H, W, 4) uint8 RGBA on the GPU.");
 
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");

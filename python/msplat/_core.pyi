@@ -139,6 +139,10 @@ class Dataset:
         """Number of training cameras with each kind of prior file attached."""
         ...
 
+    def image(self, index: int, use_test: bool = False) -> NDArray[np.float32]:
+        """Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32."""
+        ...
+
 class GaussianTrainer:
     """3D Gaussian Splatting trainer. All computation runs on the Metal GPU."""
 
@@ -180,6 +184,22 @@ class GaussianTrainer:
 
         Uses intrinsics from ref_cam_idx. Returns numpy (H, W, 3) float32.
         """
+        ...
+
+    def render_rgba8(
+        self,
+        cam_idx: int,
+        use_test: bool = False,
+    ) -> NDArray[np.uint8]:
+        """Render a camera view for display. Returns numpy (H, W, 4) uint8 RGBA, packed on the GPU."""
+        ...
+
+    def render_from_pose_rgba8(
+        self,
+        cam_to_world: NDArray[np.float32],
+        ref_cam_idx: int = 0,
+    ) -> NDArray[np.uint8]:
+        """Like render_from_pose, but returns numpy (H, W, 4) uint8 RGBA packed on the GPU."""
         ...
 
     def render_depth(

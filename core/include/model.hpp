@@ -6,8 +6,11 @@
 #include "input_data.hpp"
 
 int numShBases(int degree);
-float psnr(const MTensor& rendered, const MTensor& gt);
-float l1_loss(const MTensor& rendered, const MTensor& gt);
+
+// PSNR, SSIM (11-tap Gaussian, sigma 1.5, clamp-to-edge borders) and mean L1 error of a
+// render against its ground truth, both (H, W, 3) GPU tensors. Computed on the GPU; syncs.
+struct ImageMetrics { float psnr = 0.f, ssim = 0.f, l1 = 0.f; };
+ImageMetrics imageMetrics(const MTensor& rendered, const MTensor& gt);
 
 // Prior-guided training: geometry priors, learned sky, exposure, needle cap. Everything
 // is off by default; Model::configurePriors() enables what is set here. See priors.hpp
@@ -68,7 +71,7 @@ struct Model{
   bool priorsActive() const;
   float depthWeightAt(int step) const;
   // Expected depth (dataset units, 0 where nothing is rendered) and accumulated alpha,
-  // both (H, W) on the CPU.
+  // both (H, W), computed on the GPU. Syncs, so both are readable on return.
   void renderDepth(Camera& cam, int step, MTensor &depthOut, MTensor &alphaOut);
   // Mean prior losses of the last training step: depth, sky, fill. Syncs the GPU.
   void lastPriorLosses(float out[3]);

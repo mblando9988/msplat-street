@@ -9,6 +9,10 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <thread>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -16,28 +20,37 @@ using json = nlohmann::json;
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
-    Image raw = imreadRGB(filePath);
-    if (raw.empty()) return;
+    setImage(imreadRGBA8(filePath), downscaleFactor);
+}
+
+void Camera::setImage(const RGBA8Image &decoded, float downscaleFactor) {
+    const int rawW = decoded.width, rawH = decoded.height;
 
     // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
-        float sx = (float)raw.width / (float)width;
-        float sy = (float)raw.height / (float)height;
+    if (width > 0 && height > 0 && (rawW != width || rawH != height)) {
+        float sx = (float)rawW / (float)width;
+        float sy = (float)rawH / (float)height;
         fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = raw.width; height = raw.height;
+        width = rawW; height = rawH;
     } else if (width == 0 || height == 0) {
-        width = raw.width; height = raw.height;
+        width = rawW; height = rawH;
     }
 
     // Downscale
     if (downscaleFactor > 1.0f) {
         int newW = (int)(width / downscaleFactor);
         int newH = (int)(height / downscaleFactor);
-        raw = resizeArea(raw, newW, newH);
         float s = 1.0f / downscaleFactor;
         fx *= s; fy *= s; cx *= s; cy *= s;
         width = newW; height = newH;
     }
+    if (width < 1 || height < 1)
+        throw std::runtime_error("Downscale factor " + std::to_string(downscaleFactor) +
+                                 " leaves no pixels of " + filePath);
+
+    // RGBA8 → float RGB, area-resampled to the working size in the same pass
+    MTensor level = gpu_empty({height, width, 3}, DType::Float32);
+    msplat_resize_area(decoded.rgba, true, rawW, rawH, level, width, height);
 
     // Undistort if needed
     if (hasDistortion()) {
@@ -45,38 +58,105 @@ void Camera::loadImage(float downscaleFactor) {
         if (hasPriorFiles())
             throw std::runtime_error("Priors need undistorted images, but " + filePath +
                 " has lens distortion. Undistort the dataset first (e.g. colmap image_undistorter).");
-        auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-        raw = std::move(result.image);
-        fx = result.fx; fy = result.fy;
-        cx = result.cx; cy = result.cy;
-        width = result.width; height = result.height;
+        UndistortROI roi = undistortROI(width, height, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+        MTensor undist = gpu_empty({roi.height, roi.width, 3}, DType::Float32);
+        const float intr[4] = {fx, fy, cx, cy}, dist[5] = {k1, k2, p1, p2, k3};
+        msplat_undistort(level, width, height, intr, dist, roi.x, roi.y, undist, roi.width, roi.height);
+        level = std::move(undist);
+        cx -= roi.x; cy -= roi.y;
+        width = roi.width; height = roi.height;
         k1 = k2 = k3 = p1 = p2 = 0;
     }
 
-    image = std::move(raw);
-}
-
-Image Camera::getImage(int downscaleFactor) {
-    if (downscaleFactor <= 1) return image;
-
-    auto it = imagePyramids.find(downscaleFactor);
-    if (it != imagePyramids.end()) return it->second;
-
-    int newW = image.width / downscaleFactor;
-    int newH = image.height / downscaleFactor;
-    Image scaled = resizeArea(image, newW, newH);
-    imagePyramids[downscaleFactor] = scaled;
-    return scaled;
+    image = std::move(level);
+    imagePyramid.clear();
 }
 
 MTensor& Camera::getGPUImage(int downscaleFactor) {
-    auto it = mtensorImageCache.find(downscaleFactor);
-    if (it != mtensorImageCache.end()) return it->second;
-    Image img = getImage(downscaleFactor);
-    MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
-    memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
-    mtensorImageCache[downscaleFactor] = mt;
-    return mtensorImageCache[downscaleFactor];
+    if (!image.defined()) throw std::runtime_error("Image not loaded: " + filePath);
+    if (downscaleFactor <= 1) return image;
+
+    auto it = imagePyramid.find(downscaleFactor);
+    if (it != imagePyramid.end()) return it->second;
+
+    int w = (int)image.size(1), h = (int)image.size(0);
+    int newW = w / downscaleFactor;
+    int newH = h / downscaleFactor;
+    MTensor scaled = gpu_empty({newH, newW, 3}, DType::Float32);
+    msplat_resize_area(image, false, w, h, scaled, newW, newH);
+    return imagePyramid.emplace(downscaleFactor, std::move(scaled)).first->second;
+}
+
+void loadCameraImages(std::vector<Camera> &cameras, float downscaleFactor, int numThreads) {
+    const size_t n = cameras.size();
+    if (n == 0) return;
+    msplat_device();  // create the Metal context here, before any worker allocates
+    if (numThreads <= 0) numThreads = (int)std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    numThreads = (int)std::min<size_t>((size_t)numThreads, n);
+
+    // Workers decode into GPU-visible RGBA8 buffers, at most `window` images ahead of the
+    // consumer; this thread encodes the GPU conversion in camera order and commits so
+    // the RGBA8 buffers are released as the GPU finishes with them.
+    const size_t window = (size_t)numThreads + 2;
+    std::vector<RGBA8Image> decoded(n);
+    std::vector<std::exception_ptr> errors(n);
+    std::vector<char> ready(n, 0);
+    std::mutex m;
+    std::condition_variable cv;
+    size_t next = 0, consumed = 0;
+    bool stop = false;
+
+    auto worker = [&] {
+        for (;;) {
+            size_t i;
+            {
+                std::unique_lock<std::mutex> lock(m);
+                cv.wait(lock, [&] { return stop || next >= n || next < consumed + window; });
+                if (stop || next >= n) return;
+                i = next++;
+            }
+            RGBA8Image img;
+            std::exception_ptr err;
+            try { img = imreadRGBA8(cameras[i].filePath); }
+            catch (...) { err = std::current_exception(); }
+            {
+                std::lock_guard<std::mutex> lock(m);
+                decoded[i] = std::move(img);
+                errors[i] = err;
+                ready[i] = 1;
+            }
+            cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    struct Joiner {
+        std::vector<std::thread> &threads; std::mutex &m; std::condition_variable &cv; bool &stop;
+        ~Joiner() {
+            { std::lock_guard<std::mutex> lock(m); stop = true; }
+            cv.notify_all();
+            for (auto &t : threads) if (t.joinable()) t.join();
+        }
+    } joiner{threads, m, cv, stop};
+    for (int t = 0; t < numThreads; t++) threads.emplace_back(worker);
+
+    for (size_t i = 0; i < n; i++) {
+        RGBA8Image img;
+        {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return ready[i] != 0; });
+            if (errors[i]) std::rethrow_exception(errors[i]);
+            img = std::move(decoded[i]);
+        }
+        cameras[i].setImage(img, downscaleFactor);
+        img = RGBA8Image();   // the command buffer holds the buffer until the GPU is done
+        msplat_commit();
+        {
+            std::lock_guard<std::mutex> lock(m);
+            consumed = i + 1;
+        }
+        cv.notify_all();
+    }
 }
 
 // ── Scale & center ──────────────────────────────────────────────────────────

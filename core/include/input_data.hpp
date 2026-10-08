@@ -17,6 +17,12 @@ struct Image {
     const float* ptr() const { return data.data(); }
 };
 
+// Image decoded into GPU-visible memory: (height, width, 4) RGBA8, alpha unused
+struct RGBA8Image {
+    MTensor rgba;
+    int width = 0, height = 0;
+};
+
 struct Camera {
     int width = 0, height = 0;
     float fx = 0, fy = 0, cx = 0, cy = 0;
@@ -24,9 +30,12 @@ struct Camera {
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
 
-    Image image;
-    std::unordered_map<int, Image> imagePyramids;
-    std::unordered_map<int, MTensor> mtensorImageCache;
+    // Ground truth, GPU-resident only: (height, width, 3) float RGB in [0, 1] after the
+    // load-time downscale and undistortion. Coarser levels for the resolution schedule
+    // are area-downsampled on the GPU on first use and cached. Copies of a Camera share
+    // the buffers.
+    MTensor image;
+    std::unordered_map<int, MTensor> imagePyramid;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
@@ -43,8 +52,13 @@ struct Camera {
     int priorW = 0, priorH = 0;
     bool priorHasDepth = false, priorHasSky = false, priorHasMask = false;
 
+    // Decode, downscale and undistort the image (updating the intrinsics to match).
+    // loadCameraImages() does this for many cameras with parallel decoding.
     void loadImage(float downscaleFactor);
-    Image getImage(int downscaleFactor);
+    // Finish loading from an already decoded image: conversion, resampling and
+    // undistortion are encoded on the GPU; the decoded buffer can be dropped after.
+    void setImage(const RGBA8Image &decoded, float downscaleFactor);
+    bool hasImage() const { return image.defined(); }
     MTensor& getGPUImage(int downscaleFactor);
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
     bool hasPriorFiles() const {
@@ -56,6 +70,10 @@ struct Camera {
     // Idempotent.
     void loadPriors(float depthScale, bool useMask);
 };
+
+// Load the images of all cameras: CPU decoding on a pool of threads (0 = one per core,
+// at most 8) feeding the GPU conversion in order, with bounded memory in flight.
+void loadCameraImages(std::vector<Camera> &cameras, float downscaleFactor, int numThreads = 0);
 
 struct Points {
     std::vector<float> xyz;     // N*3 flattened
