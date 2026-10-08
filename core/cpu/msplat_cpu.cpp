@@ -25,7 +25,6 @@ using msplat_cpu::parallel_for;
 namespace {
 
 constexpr int BLOCK_X = 16, BLOCK_Y = 16;
-constexpr int MAX_TILE_ELEMS = 2048;
 
 constexpr float SH_C0 = 0.28209479177387814f;
 constexpr float SH_C1 = 0.4886025119029199f;
@@ -435,8 +434,6 @@ struct Frame {
 };
 
 Frame g_frame;
-std::atomic<bool> g_overflow{false};
-bool g_overflow_warned = false;
 
 template <typename V> void ensure_size(V &v, size_t n) {
     if (v.size() < n) v.resize(n);
@@ -503,7 +500,8 @@ void project_and_sh(Frame &f, int N, const float *means, const float *scales, fl
 }
 
 // scatter_to_prealloc_bins + bitonic_sort_per_tile: per-tile lists sorted front to
-// back by (depth, index), capped at MAX_TILE_ELEMS (the nearest are kept), packed.
+// back by (depth, index), packed. Unlike the Metal kernels, whose preallocated bins
+// hold 2048 per tile, nothing is dropped from crowded tiles.
 void bin_and_sort(Frame &f, int N, const float *opacities) {
     const int num_tiles = f.tiles_x * f.tiles_y;
     const int32_t *radii = f.radii.data<int32_t>();
@@ -533,14 +531,8 @@ void bin_and_sort(Frame &f, int N, const float *opacities) {
     parallel_for((size_t)num_tiles, 8, [&](size_t b, size_t e) {
         for (size_t t = b; t < e; t++) {
             uint64_t *first = f.bins.data() + f.bin_offset[t], *last = f.bins.data() + f.bin_offset[t + 1];
-            int64_t count = last - first;
-            if (count > MAX_TILE_ELEMS) {
-                std::partial_sort(first, first + MAX_TILE_ELEMS, last);
-                g_overflow = true;
-            } else {
-                std::sort(first, last);
-            }
-            f.tile_kept[t] = (int32_t)std::min<int64_t>(count, MAX_TILE_ELEMS);
+            std::sort(first, last);
+            f.tile_kept[t] = (int32_t)(last - first);
         }
     });
     f.tile_start.assign(num_tiles, 0);
@@ -551,6 +543,8 @@ void bin_and_sort(Frame &f, int N, const float *opacities) {
         total += f.tile_kept[t];
         f.tile_end[t] = (int32_t)total;
     }
+    if (total > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("msplat: more than 2^31 tile intersections; lower the resolution");
     ensure_size(f.isect_gid, (size_t)std::max<int64_t>(total, 1));
     ensure_size(f.pk_xy_opac, (size_t)std::max<int64_t>(total, 1) * 3);
     ensure_size(f.pk_conic, (size_t)std::max<int64_t>(total, 1) * 3);
@@ -638,11 +632,6 @@ void forward(Frame &f, int num_points, MTensor &means3d, MTensor &scales, float 
              float clip_thresh, unsigned degree, unsigned degrees_to_use, float cam_pos[3],
              MTensor &features_dc, MTensor &features_rest, MTensor &opacities, MTensor &background,
              const PriorStep *prior) {
-    if (g_overflow && !g_overflow_warned) {
-        std::fprintf(stderr, "WARNING: per-tile overflow (>%d gaussians in a tile). "
-                             "The farthest were dropped from overfull tiles.\n", MAX_TILE_ELEMS);
-        g_overflow_warned = true;
-    }
     f.num_points = num_points;
     f.W = img_width;
     f.H = img_height;
