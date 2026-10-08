@@ -44,7 +44,7 @@ jobs:
 
       - name: Build
         run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DMSPLAT_BUILD_TESTS=ON
           cmake --build build -j
 
       - name: Verify outputs
@@ -52,6 +52,9 @@ jobs:
           test -f build/msplat
           test -f build/libmsplat_core.a
           test -f build/default.metallib
+
+      - name: Gradient check (Metal)
+        run: ctest --test-dir build --output-on-failure
 
       - uses: actions/upload-artifact@v4
         with:
@@ -101,6 +104,32 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
           retention-days: 7
+
+  build-test-linux:
+    name: Linux (CPU backend)
+    runs-on: ubuntu-24.04
+    needs: version-check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+
+      - name: Build and gradient check
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DMSPLAT_BUILD_TESTS=ON
+          cmake --build build -j
+          ctest --test-dir build --output-on-failure
+
+      - name: Build wheel, install and test
+        run: |
+          uv build --wheel --python 3.12
+          uv venv .test-venv --python 3.12
+          uv pip install --python .test-venv/bin/python dist/*.whl pytest
+          .test-venv/bin/python -m pytest tests/ -x -v
 
   build-test-swift:
     name: Swift Package
