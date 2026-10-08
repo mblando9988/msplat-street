@@ -23,6 +23,31 @@ class TrainingConfig:
     save_every: int
     bg_color: list[float]
     """Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398]."""
+    depth_weight: float
+    """Weight of the log-depth prior loss (0 = off). Needs priors/depth."""
+    depth_weight_final: float
+    """Depth prior weight at the last step, log-linear schedule (<0: constant, 0: linear to 0)."""
+    depth_huber_delta: float
+    """Huber transition of the depth loss, in log depth (~ relative error)."""
+    depth_min_alpha: float
+    """Depth is only supervised where accumulated alpha exceeds this."""
+    sky_alpha_weight: float
+    """Push sky-mask pixels transparent so the learned sky shows. Needs priors/sky."""
+    fill_weight: float
+    """Push non-sky pixels opaque (cameras with a sky mask)."""
+    use_masks: bool
+    """Drop all gradients where priors/mask is 0 (moving objects)."""
+    learn_sky: bool
+    """Learn a direction-dependent sky (equirect texture) behind the gaussians."""
+    sky_width: int
+    sky_height: int
+    sky_lr: float
+    exposure_compensation: bool
+    """Per-image affine color transform, absorbing auto-exposure/white balance."""
+    exposure_lr: float
+    exposure_reg: float
+    max_scale_ratio: float
+    """Cap each gaussian's largest/median scale ratio (needle suppression; <=1 = off)."""
 
     def __init__(
         self,
@@ -44,6 +69,21 @@ class TrainingConfig:
         output: str = "splat.ply",
         save_every: int = -1,
         bg_color: list[float] = ...,
+        depth_weight: float = 0.0,
+        depth_weight_final: float = -1.0,
+        depth_huber_delta: float = 0.05,
+        depth_min_alpha: float = 0.25,
+        sky_alpha_weight: float = 0.0,
+        fill_weight: float = 0.0,
+        use_masks: bool = False,
+        learn_sky: bool = False,
+        sky_width: int = 512,
+        sky_height: int = 128,
+        sky_lr: float = 0.01,
+        exposure_compensation: bool = False,
+        exposure_lr: float = 0.005,
+        exposure_reg: float = 0.01,
+        max_scale_ratio: float = 0.0,
     ) -> None: ...
 
 class TrainingStats:
@@ -73,7 +113,13 @@ class Dataset:
         downscale_factor: float = 1.0,
         eval_mode: bool = False,
         test_every: int = 8,
-    ) -> None: ...
+        prior_dir: str = "",
+    ) -> None:
+        """prior_dir: directory of geometric priors (depth/, confidence/, sky/, mask/).
+
+        Defaults to <path>/priors when present; transforms.json frame keys take precedence.
+        """
+        ...
 
     @property
     def num_train(self) -> int:
@@ -87,6 +133,25 @@ class Dataset:
 
     def camera_pose(self, index: int) -> NDArray[np.float32]:
         """Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array."""
+        ...
+
+    def prior_counts(self) -> dict[str, int]:
+        """Number of training cameras with each kind of prior file attached."""
+        ...
+
+    def image(self, index: int, use_test: bool = False) -> NDArray[np.float32]:
+        """Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32."""
+        ...
+
+    def sizing_report(
+        self, num_downscales: int = 0, resolution_schedule: int = 3000, iterations: int = 0
+    ) -> dict:
+        """Every image's sizes as loaded (file, metadata, downscale, undistortion crop, training size,
+        intrinsics; schedule sizes when iterations > 0) with sizing findings, as a dict."""
+        ...
+
+    def export_cameras(self, path: str, keep_crs: bool = False) -> None:
+        """Write cameras.json: every camera's pose, intrinsics and image size as trained."""
         ...
 
 class GaussianTrainer:
@@ -132,6 +197,49 @@ class GaussianTrainer:
         """
         ...
 
+    def render_rgba8(
+        self,
+        cam_idx: int,
+        use_test: bool = False,
+    ) -> NDArray[np.uint8]:
+        """Render a camera view for display. Returns numpy (H, W, 4) uint8 RGBA, packed on the GPU."""
+        ...
+
+    def render_from_pose_rgba8(
+        self,
+        cam_to_world: NDArray[np.float32],
+        ref_cam_idx: int = 0,
+    ) -> NDArray[np.uint8]:
+        """Like render_from_pose, but returns numpy (H, W, 4) uint8 RGBA packed on the GPU."""
+        ...
+
+    def render_depth(
+        self,
+        cam_idx: int,
+        use_test: bool = False,
+    ) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
+        """Render expected depth (dataset units, 0 where empty) and accumulated alpha.
+
+        Returns a tuple of two numpy (H, W) float32 arrays.
+        """
+        ...
+
+    def sizing_report(self) -> dict:
+        """Dataset.sizing_report with this trainer's resolution schedule."""
+        ...
+
+    def resolution(self, cam_idx: int = 0, step: int = -1) -> tuple[int, int, int]:
+        """(width, height, factor) a training camera renders at at a step (default: the current one)."""
+        ...
+
+    def prior_losses(self) -> dict[str, float]:
+        """Mean prior losses of the last step: dict with depth, sky, fill. Syncs the GPU."""
+        ...
+
+    def export_sky(self, path: str) -> None:
+        """Save the learned sky as an equirect PNG (requires learn_sky=True)."""
+        ...
+
     def export_ply(self, path: str) -> None:
         """Export the current Gaussians as a PLY file."""
         ...
@@ -157,6 +265,30 @@ class GaussianTrainer:
     def iteration(self) -> int:
         """Current training iteration."""
         ...
+
+def preflight(
+    path: str,
+    downscale_factor: float = 1.0,
+    num_downscales: int = 2,
+    resolution_schedule: int = 3000,
+    iterations: int = 30000,
+    eval_mode: bool = False,
+    test_every: int = 8,
+    prior_dir: str = "",
+    output: str = "",
+    colmap_image_path: str = "",
+    require_depth: bool = False,
+    require_sky_masks: bool = False,
+    require_masks: bool = False,
+    strict: bool = False,
+) -> dict:
+    """Check a dataset without loading it: paths, image headers, the sizing from file to training
+    resolution, schedule, priors, point cloud and output location. Returns the report dict."""
+    ...
+
+def format_report(report: dict, verbose: bool = False) -> str:
+    """Human-readable text for a preflight or sizing report."""
+    ...
 
 def sync() -> None:
     """Synchronize GPU (wait for all commands to complete)."""

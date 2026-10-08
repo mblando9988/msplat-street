@@ -1,6 +1,7 @@
 #include "input_data.hpp"
 #include "loaders.hpp"
 #include "msplat.hpp"
+#include "priors.hpp"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
@@ -8,6 +9,10 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <thread>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -15,63 +20,124 @@ using json = nlohmann::json;
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
-    Image raw = imreadRGB(filePath);
-    if (raw.empty()) return;
+    setImage(imreadRGBA8(filePath), downscaleFactor);
+}
 
-    // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
-        float sx = (float)raw.width / (float)width;
-        float sy = (float)raw.height / (float)height;
-        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = raw.width; height = raw.height;
-    } else if (width == 0 || height == 0) {
-        width = raw.width; height = raw.height;
-    }
+void Camera::setImage(const RGBA8Image &decoded, float downscaleFactor) {
+    if (image.defined())
+        throw std::logic_error("Image already loaded (intrinsics were adapted to it): " + filePath);
+    ImageSizing s = planImageSizing(*this, decoded.width, decoded.height, downscaleFactor);
+    s.orientation = decoded.info.orientation;
+    s.exifWidth = decoded.info.exifWidth;
+    s.exifHeight = decoded.info.exifHeight;
 
-    // Downscale
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(width / downscaleFactor);
-        int newH = (int)(height / downscaleFactor);
-        raw = resizeArea(raw, newW, newH);
-        float s = 1.0f / downscaleFactor;
-        fx *= s; fy *= s; cx *= s; cy *= s;
-        width = newW; height = newH;
-    }
+    // RGBA8 → float RGB, area-resampled to the downscaled size in the same pass
+    MTensor level = gpu_empty({s.scaledHeight, s.scaledWidth, 3}, DType::Float32);
+    msplat_resize_area(decoded.rgba, true, s.fileWidth, s.fileHeight, level, s.scaledWidth, s.scaledHeight);
 
-    // Undistort if needed
-    if (hasDistortion()) {
-        auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-        raw = std::move(result.image);
-        fx = result.fx; fy = result.fy;
-        cx = result.cx; cy = result.cy;
-        width = result.width; height = result.height;
+    if (s.undistorted) {
+        MTensor undist = gpu_empty({s.height, s.width, 3}, DType::Float32);
+        // intrinsics of the downscaled image, before the crop
+        const float intr[4] = {s.fx, s.fy, s.cx + (float)s.cropX, s.cy + (float)s.cropY};
+        const float dist[5] = {k1, k2, p1, p2, k3};
+        msplat_undistort(level, s.scaledWidth, s.scaledHeight, intr, dist, s.cropX, s.cropY,
+                         undist, s.width, s.height);
+        level = std::move(undist);
         k1 = k2 = k3 = p1 = p2 = 0;
     }
 
-    image = std::move(raw);
-}
-
-Image Camera::getImage(int downscaleFactor) {
-    if (downscaleFactor <= 1) return image;
-
-    auto it = imagePyramids.find(downscaleFactor);
-    if (it != imagePyramids.end()) return it->second;
-
-    int newW = image.width / downscaleFactor;
-    int newH = image.height / downscaleFactor;
-    Image scaled = resizeArea(image, newW, newH);
-    imagePyramids[downscaleFactor] = scaled;
-    return scaled;
+    width = s.width; height = s.height;
+    fx = s.fx; fy = s.fy; cx = s.cx; cy = s.cy;
+    sizing = s;
+    image = std::move(level);
+    imagePyramid.clear();
 }
 
 MTensor& Camera::getGPUImage(int downscaleFactor) {
-    auto it = mtensorImageCache.find(downscaleFactor);
-    if (it != mtensorImageCache.end()) return it->second;
-    Image img = getImage(downscaleFactor);
-    MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
-    memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
-    mtensorImageCache[downscaleFactor] = mt;
-    return mtensorImageCache[downscaleFactor];
+    if (!image.defined()) throw std::runtime_error("Image not loaded: " + filePath);
+    if (downscaleFactor <= 1) return image;
+
+    auto it = imagePyramid.find(downscaleFactor);
+    if (it != imagePyramid.end()) return it->second;
+
+    int w = (int)image.size(1), h = (int)image.size(0);
+    int newW = levelSize(w, downscaleFactor);
+    int newH = levelSize(h, downscaleFactor);
+    MTensor scaled = gpu_empty({newH, newW, 3}, DType::Float32);
+    msplat_resize_area(image, false, w, h, scaled, newW, newH);
+    return imagePyramid.emplace(downscaleFactor, std::move(scaled)).first->second;
+}
+
+void loadCameraImages(std::vector<Camera> &cameras, float downscaleFactor, int numThreads) {
+    const size_t n = cameras.size();
+    if (n == 0) return;
+    msplat_device();  // create the Metal context here, before any worker allocates
+    if (numThreads <= 0) numThreads = (int)std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
+    numThreads = (int)std::min<size_t>((size_t)numThreads, n);
+
+    // Workers decode into GPU-visible RGBA8 buffers, at most `window` images ahead of the
+    // consumer; this thread encodes the GPU conversion in camera order and commits so
+    // the RGBA8 buffers are released as the GPU finishes with them.
+    const size_t window = (size_t)numThreads + 2;
+    std::vector<RGBA8Image> decoded(n);
+    std::vector<std::exception_ptr> errors(n);
+    std::vector<char> ready(n, 0);
+    std::mutex m;
+    std::condition_variable cv;
+    size_t next = 0, consumed = 0;
+    bool stop = false;
+
+    auto worker = [&] {
+        for (;;) {
+            size_t i;
+            {
+                std::unique_lock<std::mutex> lock(m);
+                cv.wait(lock, [&] { return stop || next >= n || next < consumed + window; });
+                if (stop || next >= n) return;
+                i = next++;
+            }
+            RGBA8Image img;
+            std::exception_ptr err;
+            try { img = imreadRGBA8(cameras[i].filePath); }
+            catch (...) { err = std::current_exception(); }
+            {
+                std::lock_guard<std::mutex> lock(m);
+                decoded[i] = std::move(img);
+                errors[i] = err;
+                ready[i] = 1;
+            }
+            cv.notify_all();
+        }
+    };
+
+    std::vector<std::thread> threads;
+    struct Joiner {
+        std::vector<std::thread> &threads; std::mutex &m; std::condition_variable &cv; bool &stop;
+        ~Joiner() {
+            { std::lock_guard<std::mutex> lock(m); stop = true; }
+            cv.notify_all();
+            for (auto &t : threads) if (t.joinable()) t.join();
+        }
+    } joiner{threads, m, cv, stop};
+    for (int t = 0; t < numThreads; t++) threads.emplace_back(worker);
+
+    for (size_t i = 0; i < n; i++) {
+        RGBA8Image img;
+        {
+            std::unique_lock<std::mutex> lock(m);
+            cv.wait(lock, [&] { return ready[i] != 0; });
+            if (errors[i]) std::rethrow_exception(errors[i]);
+            img = std::move(decoded[i]);
+        }
+        cameras[i].setImage(img, downscaleFactor);
+        img = RGBA8Image();   // the command buffer holds the buffer until the GPU is done
+        msplat_commit();
+        {
+            std::lock_guard<std::mutex> lock(m);
+            consumed = i + 1;
+        }
+        cv.notify_all();
+    }
 }
 
 // ── Scale & center ──────────────────────────────────────────────────────────
@@ -197,21 +263,29 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
 
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
-InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+std::string detectDatasetFormat(const std::string &path) {
     fs::path root(path);
-
     // Nerfstudio: transforms.json
-    if (fs::exists(root / "transforms.json"))
-        return loaders::loadNerfstudio(path);
-
+    if (fs::exists(root / "transforms.json")) return "nerfstudio";
     // COLMAP: cameras.bin (direct or in sparse/0/)
-    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin"))
-        return loaders::loadColmap(path, colmapImagePath);
-
+    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin")) return "colmap";
     // Polycam: keyframes/ directory or cameras.json
-    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
-        return loaders::loadPolycam(path);
+    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json")) return "polycam";
+    return "";
+}
 
+static InputData loadByFormat(const std::string &path, const std::string &colmapImagePath) {
+    std::string format = detectDatasetFormat(path);
+    if (format == "nerfstudio") return loaders::loadNerfstudio(path);
+    if (format == "colmap") return loaders::loadColmap(path, colmapImagePath);
+    if (format == "polycam") return loaders::loadPolycam(path);
     throw std::runtime_error("Unrecognized dataset format in: " + path +
         "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+}
+
+InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+    InputData data = loadByFormat(path, colmapImagePath);
+    data.rootDir = path;
+    attachPriors(data);  // <dataset>/priors, when present
+    return data;
 }

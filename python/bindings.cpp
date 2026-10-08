@@ -7,8 +7,10 @@
 
 #include "model.hpp"
 #include "input_data.hpp"
+#include "loaders.hpp"
 #include "msplat.hpp"
-#include "ssim.hpp"
+#include "preflight.hpp"
+#include "priors.hpp"
 
 #include <filesystem>
 #include <chrono>
@@ -43,6 +45,43 @@ struct TrainingConfig {
     // Magenta default — high contrast against typical scenes, makes
     // under-reconstructed regions obvious during training.
     std::vector<float> bg_color = {0.6130f, 0.0101f, 0.3984f};
+
+    // Prior-guided training (msplat.street_config() sets these for street captures)
+    float depth_weight = 0.0f;
+    float depth_weight_final = -1.0f;
+    float depth_huber_delta = 0.05f;
+    float depth_min_alpha = 0.25f;
+    float sky_alpha_weight = 0.0f;
+    float fill_weight = 0.0f;
+    bool use_masks = false;
+    bool learn_sky = false;
+    int sky_width = 512;
+    int sky_height = 128;
+    float sky_lr = 0.01f;
+    bool exposure_compensation = false;
+    float exposure_lr = 5e-3f;
+    float exposure_reg = 1e-2f;
+    float max_scale_ratio = 0.0f;
+
+    PriorOptions prior_options() const {
+        PriorOptions o;
+        o.depthWeight = depth_weight;
+        o.depthWeightFinal = depth_weight_final;
+        o.depthHuberDelta = depth_huber_delta;
+        o.depthMinAlpha = depth_min_alpha;
+        o.skyAlphaWeight = sky_alpha_weight;
+        o.fillWeight = fill_weight;
+        o.useMasks = use_masks;
+        o.learnSky = learn_sky;
+        o.skyWidth = sky_width;
+        o.skyHeight = sky_height;
+        o.skyLr = sky_lr;
+        o.exposure = exposure_compensation;
+        o.exposureLr = exposure_lr;
+        o.exposureReg = exposure_reg;
+        o.maxScaleRatio = max_scale_ratio;
+        return o;
+    }
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -53,6 +92,47 @@ struct TrainingStats {
     float ms_per_step;
 };
 
+// ── JSON reports ────────────────────────────────────────────────────────────
+
+static nb::object json_loads(const std::string &text) {
+    return nb::module_::import_("json").attr("loads")(text);
+}
+
+static std::string json_dumps(const nb::object &obj) {
+    return nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(obj));
+}
+
+// ── numpy conversion ────────────────────────────────────────────────────────
+
+// (H, W, 3) float image in shared memory → numpy copy (sync first)
+static nb::object to_numpy_rgb(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    float *buf = new float[h * w * 3];
+    memcpy(buf, t.data_ptr(), h * w * 3 * sizeof(float));
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+    size_t shape[3] = {h, w, 3};
+    return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+}
+
+// (H, W, 3) float image on the GPU → numpy (H, W, 4) uint8 RGBA, packed on the GPU
+static nb::object to_numpy_rgba8(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    uint8_t *buf = new uint8_t[std::max<size_t>(h * w * 4, 1)];
+    msplat_pack_rgba8(t, (uint32_t)(h * w), buf);
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<uint8_t*>(p); });
+    size_t shape[3] = {h, w, 4};
+    return nb::cast(nb::ndarray<nb::numpy, uint8_t>(buf, 3, shape, deleter));
+}
+
+static nb::object to_numpy_2d(const MTensor &t) {
+    size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+    float *buf = new float[h * w];
+    memcpy(buf, t.data_ptr(), h * w * sizeof(float));
+    nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+    size_t shape[2] = {h, w};
+    return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
+}
+
 // ── Dataset ─────────────────────────────────────────────────────────────────
 
 class Dataset {
@@ -62,14 +142,13 @@ public:
     std::vector<Camera> test_cams;
 
     Dataset(const std::string &path, float downscale_factor,
-            bool eval_mode, int test_every)
+            bool eval_mode, int test_every, const std::string &prior_dir)
     {
         data = inputDataFromX(path);
+        if (!prior_dir.empty()) attachPriors(data, prior_dir);
 
-        // Load images (parallel)
-        for (auto &cam : data.cameras) {
-            cam.loadImage(downscale_factor);
-        }
+        // Parallel decode; conversion, resampling and undistortion on the GPU
+        loadCameraImages(data.cameras, downscale_factor);
 
         if (eval_mode) {
             auto split = data.splitTrainTest(test_every);
@@ -83,6 +162,43 @@ public:
 
     size_t num_train() const { return train_cams.size(); }
     size_t num_test() const { return test_cams.size(); }
+
+    // Train cameras with prior files attached, by kind
+    nb::dict prior_counts() const {
+        int any = 0, depth = 0, conf = 0, sky = 0, mask = 0;
+        for (auto &c : train_cams) {
+            any += c.hasPriorFiles();
+            depth += !c.priorDepthPath.empty();
+            conf += !c.priorConfidencePath.empty();
+            sky += !c.priorSkyPath.empty();
+            mask += !c.priorMaskPath.empty();
+        }
+        nb::dict d;
+        d["any"] = any; d["depth"] = depth; d["confidence"] = conf; d["sky"] = sky; d["mask"] = mask;
+        return d;
+    }
+
+    // Loaded ground-truth image → numpy (H, W, 3) float32, RGB [0, 1]
+    nb::object image(int index, bool use_test) {
+        auto &cams = use_test ? test_cams : train_cams;
+        if (index < 0 || index >= (int)cams.size())
+            throw std::runtime_error("Camera index out of range");
+        msplat_gpu_sync();  // loading finishes on the GPU
+        return to_numpy_rgb(cams[index].getGPUImage(1));
+    }
+
+    // Sizes as loaded, file to training resolution (see preflight.hpp)
+    nb::object sizing_report(int num_downscales, int resolution_schedule, int iterations) const {
+        ScheduleOptions sched;
+        sched.numDownscales = num_downscales;
+        sched.resolutionSchedule = resolution_schedule;
+        sched.iterations = iterations;
+        return json_loads(sizingReport(train_cams, test_cams, sched));
+    }
+
+    void export_cameras(const std::string &path, bool keep_crs) const {
+        data.saveCameras(path, keep_crs);
+    }
 
     // Get camera-to-world pose (4x4 row-major) as numpy array
     nb::object camera_pose(int index) {
@@ -124,6 +240,7 @@ public:
             cfg.iterations, cfg.keep_crs,
             cfg.bg_color.data()
         );
+        model->configurePriors(cfg.prior_options(), dataset.train_cams);
 
         cam_indices.resize(dataset.train_cams.size());
         std::iota(cam_indices.begin(), cam_indices.end(), 0);
@@ -184,19 +301,15 @@ public:
 
         double sum_psnr = 0, sum_ssim = 0, sum_l1 = 0;
         int n = dataset_ptr->test_cams.size();
+        int ds = model->getDownscaleFactor(config.iterations);
 
         for (int i = 0; i < n; i++) {
             Camera &cam = dataset_ptr->test_cams[i];
             MTensor rgb = model->render(cam, config.iterations);
-            msplat_gpu_sync();
-
-            MTensor rgb_cpu = rgb.cpu();
-            int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = cam.getGPUImage(ds).cpu();
-
-            sum_psnr += psnr(rgb_cpu, gt_cpu);
-            sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
-            sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+            ImageMetrics m = imageMetrics(rgb, cam.getGPUImage(ds));
+            sum_psnr += m.psnr;
+            sum_ssim += m.ssim;
+            sum_l1 += m.l1;
         }
 
         nb::dict result;
@@ -215,25 +328,21 @@ public:
             throw std::runtime_error("Camera index out of range");
         }
 
-        Camera &cam = cams[cam_idx];
-        MTensor rgb = model->render(cam, current_step);
+        MTensor rgb = model->render(cams[cam_idx], current_step);
         msplat_gpu_sync();
-        MTensor rgb_cpu = rgb.cpu();
-
-        int h = rgb_cpu.size(0);
-        int w = rgb_cpu.size(1);
-
-        // Copy to numpy-owned buffer
-        float *buf = new float[h * w * 3];
-        memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
-
-        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
-        size_t shape[3] = {(size_t)h, (size_t)w, 3};
-        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+        return to_numpy_rgb(rgb);
     }
 
-    // Render from arbitrary pose → numpy (H, W, 3) float32
-    nb::object render_from_pose(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+    // Render a camera view → numpy (H, W, 4) uint8 RGBA, packed on the GPU (for display)
+    nb::object render_rgba8(int cam_idx, bool use_test) {
+        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size()) {
+            throw std::runtime_error("Camera index out of range");
+        }
+        return to_numpy_rgba8(model->render(cams[cam_idx], current_step));
+    }
+
+    Camera pose_camera(const nb::ndarray<nb::numpy, float> &cam_to_world, int ref_cam_idx) {
         if (cam_to_world.size() != 16)
             throw std::runtime_error("cam_to_world must have 16 elements (4x4 matrix)");
         if (ref_cam_idx < 0 || ref_cam_idx >= (int)dataset_ptr->train_cams.size())
@@ -243,19 +352,21 @@ public:
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
         cam.cachedViewMat = MTensor();
         cam.cachedProjViewMat = MTensor();
+        return cam;
+    }
 
+    // Render from arbitrary pose → numpy (H, W, 3) float32
+    nb::object render_from_pose(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+        Camera cam = pose_camera(cam_to_world, ref_cam_idx);
         MTensor rgb = model->render(cam, current_step);
         msplat_gpu_sync();
-        MTensor rgb_cpu = rgb.cpu();
+        return to_numpy_rgb(rgb);
+    }
 
-        int h = rgb_cpu.size(0);
-        int w = rgb_cpu.size(1);
-        float *buf = new float[h * w * 3];
-        memcpy(buf, rgb_cpu.data_ptr(), h * w * 3 * sizeof(float));
-
-        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
-        size_t shape[3] = {(size_t)h, (size_t)w, 3};
-        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 3, shape, deleter));
+    // Render from arbitrary pose → numpy (H, W, 4) uint8 RGBA, packed on the GPU
+    nb::object render_from_pose_rgba8(nb::ndarray<nb::numpy, float> cam_to_world, int ref_cam_idx) {
+        Camera cam = pose_camera(cam_to_world, ref_cam_idx);
+        return to_numpy_rgba8(model->render(cam, current_step));
     }
 
     void export_ply(const std::string &path) {
@@ -277,6 +388,42 @@ public:
     int splat_count() const {
         return model->means.size(0);
     }
+
+    // Expected depth (dataset units, 0 where empty) and accumulated alpha → numpy (H, W) each
+    nb::tuple render_depth(int cam_idx, bool use_test) {
+        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size())
+            throw std::runtime_error("Camera index out of range");
+        MTensor depth, alpha;
+        model->renderDepth(cams[cam_idx], current_step, depth, alpha);
+        return nb::make_tuple(to_numpy_2d(depth), to_numpy_2d(alpha));
+    }
+
+    nb::dict prior_losses() {
+        float l[3];
+        model->lastPriorLosses(l);
+        nb::dict d;
+        d["depth"] = l[0];
+        d["sky"] = l[1];
+        d["fill"] = l[2];
+        return d;
+    }
+
+    void export_sky(const std::string &path) {
+        model->saveSky(path);
+    }
+
+    nb::object sizing_report() const {
+        return dataset_ptr->sizing_report(config.num_downscales, config.resolution_schedule, config.iterations);
+    }
+
+    // Training resolution of a camera at a step (default: the current step)
+    nb::tuple resolution(int cam_idx, int step) const {
+        auto &cams = dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size()) throw std::runtime_error("Camera index out of range");
+        int f = model->getDownscaleFactor(step < 0 ? current_step : step);
+        return nb::make_tuple(levelSize(cams[cam_idx].width, f), levelSize(cams[cam_idx].height, f), f);
+    }
 };
 
 // ── Module definition ───────────────────────────────────────────────────────
@@ -295,7 +442,13 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color) {
+                std::vector<float> bg_color,
+                float depth_weight, float depth_weight_final,
+                float depth_huber_delta, float depth_min_alpha,
+                float sky_alpha_weight, float fill_weight, bool use_masks,
+                bool learn_sky, int sky_width, int sky_height, float sky_lr,
+                bool exposure_compensation, float exposure_lr, float exposure_reg,
+                float max_scale_ratio) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -317,6 +470,23 @@ NB_MODULE(_core, m) {
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
+            if (learn_sky && (sky_width < 4 || sky_height < 2))
+                throw std::invalid_argument("sky texture must be at least 4x2");
+            cfg->depth_weight = depth_weight;
+            cfg->depth_weight_final = depth_weight_final;
+            cfg->depth_huber_delta = depth_huber_delta;
+            cfg->depth_min_alpha = depth_min_alpha;
+            cfg->sky_alpha_weight = sky_alpha_weight;
+            cfg->fill_weight = fill_weight;
+            cfg->use_masks = use_masks;
+            cfg->learn_sky = learn_sky;
+            cfg->sky_width = sky_width;
+            cfg->sky_height = sky_height;
+            cfg->sky_lr = sky_lr;
+            cfg->exposure_compensation = exposure_compensation;
+            cfg->exposure_lr = exposure_lr;
+            cfg->exposure_reg = exposure_reg;
+            cfg->max_scale_ratio = max_scale_ratio;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -335,7 +505,22 @@ NB_MODULE(_core, m) {
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
-            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f})
+            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
+            "depth_weight"_a = 0.0f,
+            "depth_weight_final"_a = -1.0f,
+            "depth_huber_delta"_a = 0.05f,
+            "depth_min_alpha"_a = 0.25f,
+            "sky_alpha_weight"_a = 0.0f,
+            "fill_weight"_a = 0.0f,
+            "use_masks"_a = false,
+            "learn_sky"_a = false,
+            "sky_width"_a = 512,
+            "sky_height"_a = 128,
+            "sky_lr"_a = 0.01f,
+            "exposure_compensation"_a = false,
+            "exposure_lr"_a = 5e-3f,
+            "exposure_reg"_a = 1e-2f,
+            "max_scale_ratio"_a = 0.0f)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -354,7 +539,32 @@ NB_MODULE(_core, m) {
         .def_rw("output", &TrainingConfig::output)
         .def_rw("save_every", &TrainingConfig::save_every)
         .def_rw("bg_color", &TrainingConfig::bg_color,
-            "Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398].");
+            "Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398].")
+        .def_rw("depth_weight", &TrainingConfig::depth_weight,
+            "Weight of the log-depth prior loss (0 = off). Needs priors/depth.")
+        .def_rw("depth_weight_final", &TrainingConfig::depth_weight_final,
+            "Depth prior weight at the last step, log-linear schedule (<0: constant, 0: linear to 0).")
+        .def_rw("depth_huber_delta", &TrainingConfig::depth_huber_delta,
+            "Huber transition of the depth loss, in log depth (~ relative error).")
+        .def_rw("depth_min_alpha", &TrainingConfig::depth_min_alpha,
+            "Depth is only supervised where accumulated alpha exceeds this.")
+        .def_rw("sky_alpha_weight", &TrainingConfig::sky_alpha_weight,
+            "Push sky-mask pixels transparent so the learned sky shows. Needs priors/sky.")
+        .def_rw("fill_weight", &TrainingConfig::fill_weight,
+            "Push non-sky pixels opaque (cameras with a sky mask).")
+        .def_rw("use_masks", &TrainingConfig::use_masks,
+            "Drop all gradients where priors/mask is 0 (moving objects).")
+        .def_rw("learn_sky", &TrainingConfig::learn_sky,
+            "Learn a direction-dependent sky (equirect texture) behind the gaussians.")
+        .def_rw("sky_width", &TrainingConfig::sky_width)
+        .def_rw("sky_height", &TrainingConfig::sky_height)
+        .def_rw("sky_lr", &TrainingConfig::sky_lr)
+        .def_rw("exposure_compensation", &TrainingConfig::exposure_compensation,
+            "Per-image affine color transform, absorbing auto-exposure/white balance.")
+        .def_rw("exposure_lr", &TrainingConfig::exposure_lr)
+        .def_rw("exposure_reg", &TrainingConfig::exposure_reg)
+        .def_rw("max_scale_ratio", &TrainingConfig::max_scale_ratio,
+            "Cap each gaussian's largest/median scale ratio (needle suppression; <=1 = off).");
 
     // TrainingStats
     nb::class_<TrainingStats>(m, "TrainingStats",
@@ -371,13 +581,25 @@ NB_MODULE(_core, m) {
     // Dataset
     nb::class_<Dataset>(m, "Dataset",
             "A loaded dataset of camera images. Auto-detects COLMAP, Nerfstudio, and Polycam formats.")
-        .def(nb::init<const std::string &, float, bool, int>(),
+        .def(nb::init<const std::string &, float, bool, int, const std::string &>(),
             "path"_a, "downscale_factor"_a = 1.0f,
-            "eval_mode"_a = false, "test_every"_a = 8)
+            "eval_mode"_a = false, "test_every"_a = 8, "prior_dir"_a = "",
+            "prior_dir: directory of geometric priors (depth/, confidence/, sky/, mask/).\n"
+            "Defaults to <path>/priors when present; transforms.json frame keys take precedence.")
         .def_prop_ro("num_train", &Dataset::num_train, "Number of training cameras.")
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,
-            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.");
+            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.")
+        .def("image", &Dataset::image, "index"_a, "use_test"_a = false,
+            "Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32.")
+        .def("prior_counts", &Dataset::prior_counts,
+            "Number of training cameras with each kind of prior file attached.")
+        .def("sizing_report", &Dataset::sizing_report,
+            "num_downscales"_a = 0, "resolution_schedule"_a = 3000, "iterations"_a = 0,
+            "Every image's sizes as loaded (file, metadata, downscale, undistortion crop, training size,\n"
+            "intrinsics; schedule sizes when iterations > 0) with sizing findings, as a dict.")
+        .def("export_cameras", &Dataset::export_cameras, "path"_a, "keep_crs"_a = false,
+            "Write cameras.json: every camera's pose, intrinsics and image size as trained.");
 
     // GaussianTrainer
     nb::class_<GaussianTrainer>(m, "GaussianTrainer",
@@ -399,6 +621,12 @@ NB_MODULE(_core, m) {
             "cam_to_world"_a, "ref_cam_idx"_a = 0,
             "Render from an arbitrary camera-to-world pose (4x4 row-major, OpenGL convention).\n"
             "Uses intrinsics from ref_cam_idx. Returns numpy (H, W, 3) float32.")
+        .def("render_rgba8", &GaussianTrainer::render_rgba8,
+            "cam_idx"_a, "use_test"_a = false,
+            "Render a camera view for display. Returns numpy (H, W, 4) uint8 RGBA, packed on the GPU.")
+        .def("render_from_pose_rgba8", &GaussianTrainer::render_from_pose_rgba8,
+            "cam_to_world"_a, "ref_cam_idx"_a = 0,
+            "Like render_from_pose, but returns numpy (H, W, 4) uint8 RGBA packed on the GPU.")
         .def("export_ply", &GaussianTrainer::export_ply, "path"_a,
             "Export the current Gaussians as a PLY file.")
         .def("export_splat", &GaussianTrainer::export_splat, "path"_a,
@@ -407,10 +635,142 @@ NB_MODULE(_core, m) {
             "Save a training checkpoint.")
         .def("load_checkpoint", &GaussianTrainer::load_checkpoint, "path"_a,
             "Load a training checkpoint and resume from the saved iteration.")
+        .def("render_depth", &GaussianTrainer::render_depth,
+            "cam_idx"_a, "use_test"_a = false,
+            "Render expected depth (dataset units, 0 where empty) and accumulated alpha.\n"
+            "Returns a tuple of two numpy (H, W) float32 arrays.")
+        .def("prior_losses", &GaussianTrainer::prior_losses,
+            "Mean prior losses of the last step: dict with depth, sky, fill. Syncs the GPU.")
+        .def("export_sky", &GaussianTrainer::export_sky, "path"_a,
+            "Save the learned sky as an equirect PNG (requires learn_sky=True).")
+        .def("sizing_report", &GaussianTrainer::sizing_report,
+            "Dataset.sizing_report with this trainer's resolution schedule.")
+        .def("resolution", &GaussianTrainer::resolution, "cam_idx"_a = 0, "step"_a = -1,
+            "(width, height, factor) a training camera renders at at a step (default: the current one).")
         .def_prop_ro("splat_count", &GaussianTrainer::splat_count,
             "Current number of active Gaussians.")
         .def_prop_ro("iteration", [](const GaussianTrainer &t) { return t.current_step; },
             "Current training iteration.");
+
+    // Test hooks for the GPU primitives (validated against NumPy in tests/)
+    m.def("_gpu_radix_sort", [](nb::ndarray<const uint64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> keys,
+                                int key_bits) {
+        size_t n = keys.shape(0);
+        MTensor k = gpu_empty({(int64_t)std::max<size_t>(n, 1)}, DType::Int64);
+        MTensor v = gpu_empty({(int64_t)std::max<size_t>(n, 1)}, DType::Int32);
+        memcpy(k.data_ptr(), keys.data(), n * sizeof(uint64_t));
+        uint32_t *vp = v.data<uint32_t>();
+        for (size_t i = 0; i < n; i++) vp[i] = (uint32_t)i;
+        msplat_radix_sort(k, v, (uint32_t)n, key_bits);
+        msplat_gpu_sync();
+        uint64_t *ko = new uint64_t[std::max<size_t>(n, 1)];
+        uint32_t *vo = new uint32_t[std::max<size_t>(n, 1)];
+        memcpy(ko, k.data_ptr(), n * sizeof(uint64_t));
+        memcpy(vo, v.data_ptr(), n * sizeof(uint32_t));
+        nb::capsule kd(ko, [](void *p) noexcept { delete[] static_cast<uint64_t*>(p); });
+        nb::capsule vd(vo, [](void *p) noexcept { delete[] static_cast<uint32_t*>(p); });
+        size_t shape[1] = {n};
+        return nb::make_tuple(nb::ndarray<nb::numpy, uint64_t>(ko, 1, shape, kd),
+                              nb::ndarray<nb::numpy, uint32_t>(vo, 1, shape, vd));
+    }, "keys"_a, "key_bits"_a = 64,
+       "Stable GPU radix sort of uint64 keys. Returns (sorted_keys, order).");
+    m.def("_gpu_knn3_mean_dist", [](nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> points) {
+        size_t n = points.shape(0);
+        if (n == 0) throw std::invalid_argument("points must not be empty");
+        MTensor p = gpu_empty({(int64_t)n, 3}, DType::Float32);
+        memcpy(p.data_ptr(), points.data(), n * 3 * sizeof(float));
+        MTensor d = gpu_empty({(int64_t)n}, DType::Float32);
+        msplat_knn3_mean_dist(p, (uint32_t)n, d);
+        msplat_gpu_sync();
+        float *out = new float[n];
+        memcpy(out, d.data_ptr(), n * sizeof(float));
+        nb::capsule del(out, [](void *q) noexcept { delete[] static_cast<float*>(q); });
+        size_t shape[1] = {n};
+        return nb::ndarray<nb::numpy, float>(out, 1, shape, del);
+    }, "points"_a, "Exact mean distance to the 3 nearest other points, computed on the GPU.");
+
+    m.def("_gpu_resize_area", [](nb::ndarray<nb::ndim<3>, nb::c_contig, nb::device::cpu> img,
+                                 int out_w, int out_h) {
+        size_t h = img.shape(0), w = img.shape(1), c = img.shape(2);
+        bool u8 = img.dtype() == nb::dtype<uint8_t>() && c == 4;
+        if (!u8 && !(img.dtype() == nb::dtype<float>() && c == 3))
+            throw std::invalid_argument("img must be (H, W, 4) uint8 or (H, W, 3) float32");
+        if (out_w < 1 || out_h < 1) throw std::invalid_argument("output size must be positive");
+        MTensor src = gpu_empty({(int64_t)h, (int64_t)w, (int64_t)c}, u8 ? DType::UInt8 : DType::Float32);
+        memcpy(src.data_ptr(), img.data(), src.nbytes());
+        MTensor dst = gpu_empty({out_h, out_w, 3}, DType::Float32);
+        msplat_resize_area(src, u8, (int)w, (int)h, dst, out_w, out_h);
+        msplat_gpu_sync();
+        return to_numpy_rgb(dst);
+    }, "img"_a, "out_w"_a, "out_h"_a,
+       "Area resample on the GPU: (H, W, 4) uint8 or (H, W, 3) float32 → (out_h, out_w, 3) float32.");
+    m.def("_gpu_undistort", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> img,
+                               std::vector<float> intrinsics, std::vector<float> distortion) {
+        if (intrinsics.size() != 4 || distortion.size() != 5)
+            throw std::invalid_argument("intrinsics = [fx, fy, cx, cy], distortion = [k1, k2, p1, p2, k3]");
+        int h = (int)img.shape(0), w = (int)img.shape(1);
+        const float *k = intrinsics.data(), *d = distortion.data();
+        UndistortROI roi = undistortROI(w, h, k[0], k[1], k[2], k[3], d[0], d[1], d[2], d[3], d[4]);
+        MTensor src = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(src.data_ptr(), img.data(), src.nbytes());
+        MTensor dst = gpu_empty({roi.height, roi.width, 3}, DType::Float32);
+        msplat_undistort(src, w, h, k, d, roi.x, roi.y, dst, roi.width, roi.height);
+        msplat_gpu_sync();
+        return nb::make_tuple(to_numpy_rgb(dst), roi.x, roi.y);
+    }, "img"_a, "intrinsics"_a, "distortion"_a,
+       "Undistort on the GPU into the alpha=0 crop. Returns (image, roi_x, roi_y).");
+    m.def("_gpu_image_metrics", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> rendered,
+                                   nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> gt) {
+        if (rendered.shape(0) != gt.shape(0) || rendered.shape(1) != gt.shape(1))
+            throw std::invalid_argument("images must have the same size");
+        int64_t h = (int64_t)rendered.shape(0), w = (int64_t)rendered.shape(1);
+        MTensor a = gpu_empty({h, w, 3}, DType::Float32), b = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(a.data_ptr(), rendered.data(), a.nbytes());
+        memcpy(b.data_ptr(), gt.data(), b.nbytes());
+        ImageMetrics m = imageMetrics(a, b);
+        return nb::make_tuple(m.psnr, m.ssim, m.l1);
+    }, "rendered"_a, "gt"_a, "GPU (psnr, ssim, l1) of two (H, W, 3) float32 images.");
+    m.def("_gpu_pack_rgba8", [](nb::ndarray<const float, nb::shape<-1, -1, 3>, nb::c_contig, nb::device::cpu> img) {
+        int64_t h = (int64_t)img.shape(0), w = (int64_t)img.shape(1);
+        MTensor t = gpu_empty({h, w, 3}, DType::Float32);
+        memcpy(t.data_ptr(), img.data(), t.nbytes());
+        return to_numpy_rgba8(t);
+    }, "img"_a, "Pack (H, W, 3) float32 into (H, W, 4) uint8 RGBA on the GPU.");
+
+    m.def("preflight", [](const std::string &path, float downscale_factor, int num_downscales,
+                          int resolution_schedule, int iterations, bool eval_mode, int test_every,
+                          const std::string &prior_dir, const std::string &output,
+                          const std::string &colmap_image_path, bool require_depth, bool require_sky_masks,
+                          bool require_masks, bool strict) {
+        PreflightOptions o;
+        o.downscaleFactor = downscale_factor;
+        o.numDownscales = num_downscales;
+        o.resolutionSchedule = resolution_schedule;
+        o.iterations = iterations;
+        o.evalMode = eval_mode;
+        o.testEvery = test_every;
+        o.priorDir = prior_dir;
+        o.output = output;
+        o.colmapImagePath = colmap_image_path;
+        o.requireDepth = require_depth;
+        o.requireSkyMasks = require_sky_masks;
+        o.requireMasks = require_masks;
+        o.strict = strict;
+        std::string report;
+        {
+            nb::gil_scoped_release release;
+            report = preflightDataset(path, o);
+        }
+        return json_loads(report);
+    }, "path"_a, "downscale_factor"_a = 1.0f, "num_downscales"_a = 2, "resolution_schedule"_a = 3000,
+       "iterations"_a = 30000, "eval_mode"_a = false, "test_every"_a = 8, "prior_dir"_a = "",
+       "output"_a = "", "colmap_image_path"_a = "", "require_depth"_a = false,
+       "require_sky_masks"_a = false, "require_masks"_a = false, "strict"_a = false,
+       "Check a dataset without loading it: paths, image headers, the sizing from file to training\n"
+       "resolution, schedule, priors, point cloud and output location. Returns the report dict.");
+    m.def("format_report", [](nb::object report, bool verbose) {
+        return formatReport(json_dumps(report), verbose);
+    }, "report"_a, "verbose"_a = false, "Human-readable text for a preflight or sizing report.");
 
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");

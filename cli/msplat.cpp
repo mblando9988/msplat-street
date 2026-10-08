@@ -11,6 +11,7 @@
 #include "input_data.hpp"
 #include "random_iter.hpp"
 #include "loaders.hpp"
+#include "priors.hpp"
 #include "msplat.hpp"
 #include "bindings.h"
 
@@ -93,7 +94,42 @@ int main(int argc, char *argv[]) {
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
+    // Prior-guided training (street view / sparse forward captures; see msplat-prior)
+    std::string preset;
+    app.add_option("--preset", preset, "Option preset: 'street' turns on the prior-guided terms below")
+        ->check(CLI::IsMember({"street"}));
+    std::string priorDir;
+    app.add_option("--prior-dir", priorDir, "Prior directory (default: <dataset>/priors)")
+        ->check(CLI::ExistingDirectory);
+    PriorOptions priorOpts;
+    app.add_option("--depth-weight", priorOpts.depthWeight, "Depth prior loss weight (0 = off)");
+    app.add_option("--depth-weight-final", priorOpts.depthWeightFinal, "Depth prior weight at the last step (<0: constant)");
+    app.add_option("--sky-alpha-weight", priorOpts.skyAlphaWeight, "Push sky-mask pixels transparent");
+    app.add_option("--fill-weight", priorOpts.fillWeight, "Push non-sky pixels opaque (needs sky masks)");
+    app.add_flag("--use-masks", priorOpts.useMasks, "Ignore pixels where priors/mask is 0 (moving objects)");
+    app.add_flag("--learn-sky", priorOpts.learnSky, "Learn a direction-dependent sky behind the gaussians");
+    std::vector<int> skyRes = {512, 128};
+    app.add_option("--sky-res", skyRes, "Sky texture width height")->expected(2);
+    app.add_flag("--exposure-comp", priorOpts.exposure, "Per-image affine exposure compensation");
+    app.add_option("--max-scale-ratio", priorOpts.maxScaleRatio, "Cap largest/median gaussian scale (0 = off)");
+
     CLI11_PARSE(app, argc, argv);
+
+    // The preset fills in every prior option the command line left unset.
+    if (preset == "street") {
+        auto unset = [&](const char *name) { return app.get_option(name)->count() == 0; };
+        if (unset("--depth-weight")) priorOpts.depthWeight = 0.2f;
+        if (unset("--depth-weight-final")) priorOpts.depthWeightFinal = 0.05f;
+        if (unset("--sky-alpha-weight")) priorOpts.skyAlphaWeight = 0.05f;
+        if (unset("--fill-weight")) priorOpts.fillWeight = 0.01f;
+        if (unset("--use-masks")) priorOpts.useMasks = true;
+        if (unset("--learn-sky")) priorOpts.learnSky = true;
+        if (unset("--exposure-comp")) priorOpts.exposure = true;
+        if (unset("--max-scale-ratio")) priorOpts.maxScaleRatio = 10.0f;
+        if (unset("--sh-degree")) shDegree = 1;
+    }
+    priorOpts.skyWidth = skyRes[0];
+    priorOpts.skyHeight = skyRes[1];
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -101,9 +137,9 @@ int main(int argc, char *argv[]) {
 
     try {
         InputData inputData = inputDataFromX(projectRoot, colmapImagePath);
+        if (!priorDir.empty()) attachPriors(inputData, priorDir);
 
-        for (auto &cam : inputData.cameras)
-            cam.loadImage(downScaleFactor);
+        loadCameraImages(inputData.cameras, downScaleFactor);
 
         std::vector<Camera> cams;
         std::vector<Camera> testCams;
@@ -124,6 +160,7 @@ int main(int argc, char *argv[]) {
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
                      bgColor.data());
+        model.configurePriors(priorOpts, cams);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -213,12 +250,11 @@ int main(int argc, char *argv[]) {
             if (!valRender.empty() && step % 10 == 0) {
                 MTensor rgb = model.render(*valCam, step);
                 msplat_gpu_sync();
-                MTensor rgb_cpu = rgb.cpu();
                 Image valImg;
-                valImg.width = (int)rgb_cpu.size(1);
-                valImg.height = (int)rgb_cpu.size(0);
-                valImg.data.resize(valImg.width * valImg.height * 3);
-                memcpy(valImg.ptr(), rgb_cpu.data_ptr(), valImg.data.size() * sizeof(float));
+                valImg.width = (int)rgb.size(1);
+                valImg.height = (int)rgb.size(0);
+                const float *px = rgb.data<float>();
+                valImg.data.assign(px, px + rgb.numel());
                 imwriteRGB((fs::path(valRender) / (std::to_string(step) + ".png")).string(), valImg);
             }
         }
@@ -317,6 +353,11 @@ int main(int argc, char *argv[]) {
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);
+        if (priorOpts.learnSky) {
+            fs::path skyPath = fs::path(outputScene).replace_extension("").string() + "_sky.png";
+            model.saveSky(skyPath.string());
+            std::cout << "Saved learned sky: " << skyPath.string() << std::endl;
+        }
 
         // Evaluation
         if (evalMode && !testCams.empty()) {
@@ -324,20 +365,15 @@ int main(int argc, char *argv[]) {
             int nTest = testCams.size();
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
+            const int evalDs = model.getDownscaleFactor(numIters);
             for (int i = 0; i < nTest; i++) {
                 MTensor rgb = model.render(testCams[i], numIters);
-                msplat_gpu_sync();
-                MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = testCams[i].getGPUImage(model.getDownscaleFactor(numIters)).cpu();
-
-                float p = psnr(rgb_cpu, gt_cpu);
-                float s = ssim_eval(rgb_cpu, gt_cpu);
-                float l = l1_loss(rgb_cpu, gt_cpu);
-                sumPsnr += p; sumSsim += s; sumL1 += l;
+                ImageMetrics m = imageMetrics(rgb, testCams[i].getGPUImage(evalDs));
+                sumPsnr += m.psnr; sumSsim += m.ssim; sumL1 += m.l1;
 
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
                           << fs::path(testCams[i].filePath).filename().string()
-                          << "  PSNR=" << p << "  SSIM=" << s << "  L1=" << l << std::endl;
+                          << "  PSNR=" << m.psnr << "  SSIM=" << m.ssim << "  L1=" << m.l1 << std::endl;
             }
             std::cout << "\n  PSNR:  " << (sumPsnr / nTest)
                       << "  SSIM:  " << (sumSsim / nTest)
@@ -348,14 +384,12 @@ int main(int argc, char *argv[]) {
         // Validation
         if (valCam) {
             MTensor rgb = model.render(*valCam, numIters);
-            msplat_gpu_sync();
-            MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = valCam->getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+            ImageMetrics m = imageMetrics(rgb, valCam->getGPUImage(model.getDownscaleFactor(numIters)));
 
             std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
-            std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)
-                      << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu)
-                      << "  L1:  " << l1_loss(rgb_cpu, gt_cpu)
+            std::cout << "  PSNR:  " << m.psnr
+                      << "  SSIM:  " << m.ssim
+                      << "  L1:  " << m.l1
                       << "  Gaussians: " << model.means.size(0) << std::endl;
         }
 

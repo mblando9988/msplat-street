@@ -38,6 +38,44 @@ void msplat_drain_gpu_times(std::vector<double>& out);
 void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages, int& n_stages,
                               const char** stage_names);
 
+// Optional extras for prior-guided training (depth/sky priors, learned sky, exposure,
+// needle cap). A null PriorStep* — the default — runs the original pipeline unchanged.
+struct PriorStep {
+    // Rasterize expected depth and alpha with a per-pixel background. Required by the
+    // learned sky and by every prior loss; when false the default rasterizer runs and
+    // the sky and prior-loss fields below are ignored. Forces the monolithic rasterizer.
+    bool aux = false;
+
+    // Learned sky: equirect texture (sky_h, sky_w, 3) sampled by view direction and
+    // composited behind the gaussians.
+    bool sky = false;
+    MTensor *sky_tex = nullptr;
+    MTensor *sky_grad = nullptr, *sky_exp_avg = nullptr, *sky_exp_avg_sq = nullptr;  // train only
+    int sky_w = 0, sky_h = 0;
+    float sky_frame[9] = {};              // up, e1 (azimuth 0), e2 (azimuth 90 deg)
+    float sky_step_size = 0.f, sky_bc2_sqrt = 1.f;
+
+    // Per-camera priors at their native resolution (train only).
+    MTensor *prior_depth = nullptr;       // (prior_h, prior_w) float, scene units, 0 = invalid
+    MTensor *prior_aux = nullptr;         // (prior_h, prior_w, 4) uint8: confidence, sky, keep, -
+    int prior_w = 0, prior_h = 0;
+    bool has_depth = false, has_sky_mask = false;
+    float depth_weight = 0.f, sky_weight = 0.f, fill_weight = 0.f;
+    float huber_delta = 0.05f, min_alpha = 0.25f;
+    bool mask_photometric = true;
+    MTensor *loss_terms = nullptr;        // [4] float: depth, sky, fill, - (zeroed every step)
+
+    // Per-image affine exposure compensation (train only).
+    bool exposure = false;
+    int cam_index = 0;
+    MTensor *expo_params = nullptr, *expo_exp_avg = nullptr, *expo_exp_avg_sq = nullptr;  // (num_cams, 12)
+    MTensor *expo_grad = nullptr;         // [12], zeroed by the GPU after each update
+    float expo_step_size = 0.f, expo_bc2_sqrt = 1.f, expo_reg = 0.f;
+
+    // Needle cap: largest scale <= exp(log_max_scale_ratio) x median scale (train only).
+    float log_max_scale_ratio = 0.f;      // <= 0 disables
+};
+
 // Render-only forward pass (no loss computation)
 // Returns: out_img (H, W, 3) as MTensor
 MTensor msplat_render(
@@ -48,8 +86,14 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    const PriorStep *prior = nullptr
 );
+
+// After msplat_render with prior->aux set: the expected-depth numerator sum_i w_i z_i
+// (H, W) and the final transmittance (H, W), so alpha = 1 - final_T and expected
+// depth = depth / alpha. Aliases of cached buffers — sync, then copy before the next call.
+void msplat_render_aux_outputs(MTensor &depth, MTensor &final_T);
 
 // Fused forward + backward + Adam + grad_stats in one encoder
 // Returns: (radii [N], loss_value float)
@@ -69,7 +113,8 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    const PriorStep *prior = nullptr
 );
 
 int msplat_densify(
@@ -86,7 +131,52 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    uint32_t seed  // split offsets are drawn in-kernel from this seed
 );
+
+// Opacity reset on the GPU: opacity logits clamped to <= reset_logit, Adam moments
+// of the opacity group cleared. Encoded after the in-flight step; no host sync.
+void msplat_opacity_reset(MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+                          int num_points, float reset_logit);
+
+// GPU copy of the first `bytes` of src into dst, ordered after the in-flight work.
+void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes);
+
+// Stable LSD radix sort of (keys: Int64 [n], vals: Int32 [n]) by the low key_bits bits
+// of the keys, in place on the GPU. Encoded into the in-flight command buffer.
+void msplat_radix_sort(MTensor &keys, MTensor &vals, uint32_t n, int key_bits);
+
+// Exact mean distance from each of n points (n, 3) to its 3 nearest other points,
+// written to mean_dist (n). Morton-ordered boxes with distance culling (simple-knn).
+void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist);
+
+// Gaussian initialization from points (n, 3) and colors (n, 3 uint8), entirely on the
+// GPU: 3-NN isotropic log-scales, uniformly random rotations, DC SH, constant opacity.
+void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t seed, float opacity_logit,
+                           MTensor &scales, MTensor &quats, MTensor &features_dc, MTensor &opacities);
+
+// ── Image pipeline, metrics, display ──
+// All encoded into the in-flight command buffer; only the metrics and RGBA8 packing sync.
+
+// Area (box) resample to (dh, dw, 3) float RGB. src is (sh, sw, 4) RGBA8 when src_is_u8,
+// else (sh, sw, 3) float RGB; equal sizes convert without resampling.
+void msplat_resize_area(const MTensor &src, bool src_is_u8, int sw, int sh, MTensor &dst, int dw, int dh);
+
+// Brown-Conrady undistortion of (sh, sw, 3) float RGB into the (dh, dw, 3) crop at
+// (roi_x, roi_y) of the undistorted image. intr = fx, fy, cx, cy; dist = k1, k2, p1, p2, k3.
+void msplat_undistort(const MTensor &src, int sw, int sh, const float intr[4], const float dist[5],
+                      int roi_x, int roi_y, MTensor &dst, int dw, int dh);
+
+// PSNR, SSIM (11-tap Gaussian, clamp-to-edge borders) and L1 of two (h, w, 3) images,
+// written to out in that order. Syncs.
+void msplat_image_metrics(const MTensor &rendered, const MTensor &gt, int h, int w, double out[3]);
+
+// Float RGB (n, 3) to RGBA8 (n, 4) for display, written to out. Syncs.
+void msplat_pack_rgba8(const MTensor &img, uint32_t n, uint8_t *out);
+
+// Expected depth (depth_num / alpha * inv_scale, 0 where alpha <= 1e-4) and alpha from
+// the aux render outputs (see msplat_render_aux_outputs).
+void msplat_finalize_depth(const MTensor &depth_num, const MTensor &final_T, uint32_t n, float inv_scale,
+                           MTensor &depth_out, MTensor &alpha_out);
 
 #endif

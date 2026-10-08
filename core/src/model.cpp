@@ -1,15 +1,15 @@
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include "model.hpp"
-#include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
+#include "priors.hpp"
 
 namespace fs = std::filesystem;
-
-static const double C0 = 0.28209479177387814;
 
 int numShBases(int degree){
     switch(degree){
@@ -22,21 +22,15 @@ int numShBases(int degree){
 }
 
 // Metrics on CPU MTensor data
-float psnr(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double mse = 0;
-    for (int64_t i = 0; i < n; i++) { double d = r[i] - g[i]; mse += d * d; }
-    mse /= n;
-    return 10.0f * std::log10(1.0 / mse);
-}
-
-float l1_loss(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double sum = 0;
-    for (int64_t i = 0; i < n; i++) sum += std::abs(r[i] - g[i]);
-    return (float)(sum / n);
+ImageMetrics imageMetrics(const MTensor& rendered, const MTensor& gt) {
+    if (rendered.ndim() != 3 || gt.ndim() != 3 || rendered.size(2) != 3 || gt.size(2) != 3 ||
+        rendered.size(0) != gt.size(0) || rendered.size(1) != gt.size(1))
+        throw std::invalid_argument("imageMetrics: expected two (H, W, 3) images of equal size");
+    if (!rendered.isGpu() || !gt.isGpu())
+        throw std::invalid_argument("imageMetrics: images must be GPU tensors");
+    double m[3];
+    msplat_image_metrics(rendered, gt, (int)rendered.size(0), (int)rendered.size(1), m);
+    return {(float)m[0], (float)m[1], (float)m[2]};
 }
 
 // Model constructor
@@ -53,60 +47,28 @@ Model::Model(const InputData &inputData, int numCameras,
       maxSteps(maxSteps), keepCrs(keepCrs) {
 
     int64_t numPoints = inputData.points.count;
+    if (numPoints <= 0)
+        throw std::runtime_error("Dataset has no initial point cloud (points3D.bin / .ply) to initialize gaussians from");
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
 
-    // Means: copy xyz directly to GPU
+    // Upload points and colors; scales (exact 3-NN distance), random rotations,
+    // DC SH and opacities are then computed on the GPU.
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
+    MTensor rgb = gpu_empty({numPoints, 3}, DType::UInt8);
+    memcpy(rgb.data_ptr(), inputData.points.rgb.data(), numPoints * 3);
 
-    // Scales: KD-tree nearest neighbor distances, log'd, repeated 3x
-    {
-        PointsTensor pt(inputData.points.xyz.data(), numPoints);
-        auto sc = pt.scales();  // vector<float> of length numPoints
-        scales = gpu_empty({numPoints, 3}, DType::Float32);
-        float *sp = scales.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) {
-            float v = std::log(sc[i]);
-            sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
-        }
-    }
-
-    // Random quaternions
-    {
-        std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        quats = gpu_empty({numPoints, 4}, DType::Float32);
-        float *qp = quats.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) {
-            float u = dist(rng), v = dist(rng), w = dist(rng);
-            qp[i*4+0] = std::sqrt(1-u) * std::sin(2*M_PI*v);
-            qp[i*4+1] = std::sqrt(1-u) * std::cos(2*M_PI*v);
-            qp[i*4+2] = std::sqrt(u) * std::sin(2*M_PI*w);
-            qp[i*4+3] = std::sqrt(u) * std::cos(2*M_PI*w);
-        }
-    }
-
-    // SH features: f_dc = rgb2sh(rgb), f_rest = zeros
+    scales = gpu_empty({numPoints, 3}, DType::Float32);
+    quats = gpu_empty({numPoints, 4}, DType::Float32);
+    featuresDc = gpu_empty({numPoints, 3}, DType::Float32);
+    opacities = gpu_empty({numPoints, 1}, DType::Float32);
     int dimSh = numShBases(shDegree);
-    {
-        featuresDc = gpu_empty({numPoints, 3}, DType::Float32);
-        float *dp = featuresDc.data<float>();
-        const uint8_t *rgb = inputData.points.rgb.data();
-        for (int64_t i = 0; i < numPoints; i++) {
-            for (int c = 0; c < 3; c++)
-                dp[i*3+c] = (float)((rgb[i*3+c] / 255.0 - 0.5) / C0);
-        }
-        featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
-    }
+    featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
 
-    // Opacities: logit(0.1) = log(0.1/0.9)
-    {
-        float logit01 = std::log(0.1f / 0.9f);
-        opacities = gpu_empty({numPoints, 1}, DType::Float32);
-        float *op = opacities.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
-    }
+    const float logit01 = std::log(0.1f / 0.9f);  // initial opacity 0.1
+    msplat_init_gaussians(means, rgb, (uint32_t)numPoints, 42u, logit01,
+                          scales, quats, featuresDc, opacities);
 
     // Background color — default is magenta (high-contrast against typical scenes,
     // makes under-reconstructed regions obvious during training)
@@ -119,14 +81,14 @@ Model::Model(const InputData &inputData, int numCameras,
 void Model::setupOptimizers(){
     releaseOptimizers();
 
-
     num_active = means.size(0);
     buf_capacity = num_active * 4;
+    // GPU copies: the parameters may still be pending GPU work (msplat_init_gaussians)
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
         buf = gpu_zeros(shape, DType::Float32);
-        memcpy(buf.data_ptr(), param.data_ptr(), param.nbytes());
+        msplat_copy_buffer(buf, param, param.nbytes());
     };
     allocBuf(means_buf, means);
     allocBuf(scales_buf, scales);
@@ -158,7 +120,6 @@ void Model::setupOptimizers(){
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
 }
@@ -173,7 +134,7 @@ void Model::releaseOptimizers(){
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
-    densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    densify_block_totals.reset(); densify_compact_scratch.reset();
 }
 
 void Model::schedulersStep(int step){
@@ -198,12 +159,16 @@ void Model::ensureCapacity(int needed){
     if (needed <= buf_capacity) return;
     int new_cap = std::max(needed, buf_capacity * 2);
 
+    // The copy is a GPU blit encoded after this step's work, so it carries this step's
+    // Adam update. A CPU memcpy here would read the buffers before the GPU wrote them,
+    // and race with the previous command buffer still in flight. The old buffers stay
+    // alive until the command buffer that references them completes.
     auto grow = [&](MTensor &buf) {
         auto shape = buf.shape();
         shape[0] = new_cap;
         MTensor new_buf = gpu_zeros(shape, DType::Float32);
-        size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
-        memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
+        size_t copy_bytes = (size_t)num_active * buf.stride0() * sizeof(float);
+        msplat_copy_buffer(new_buf, buf, copy_bytes);
         buf = new_buf;
     };
     grow(means_buf); grow(scales_buf); grow(quats_buf);
@@ -222,15 +187,13 @@ void Model::ensureCapacity(int needed){
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
     buf_capacity = new_cap;
     refreshViews();
 }
 
 int Model::getDownscaleFactor(int step) {
-    int remaining = numDownscales - step / resolutionSchedule;
-    return 1 << std::max(remaining, 0);
+    return scheduleDownscaleFactor(step, numDownscales, resolutionSchedule);
 }
 
 void Model::afterTrain(int step){
@@ -243,14 +206,6 @@ void Model::afterTrain(int step){
         if (doDensification){
             int numPointsBefore = num_active;
             ensureCapacity(3 * num_active);  // worst case: every gaussian splits
-
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * num_active * 3; i++) p[i] = dist(rng);
-            }
 
             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
             int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
@@ -269,7 +224,7 @@ void Model::afterTrain(int step){
                 densify_split_prefix, densify_dup_prefix,
                 densify_keep_flag, densify_keep_prefix,
                 densify_block_totals, densify_compact_scratch,
-                densify_random_samples
+                (uint32_t)step * 2654435761u  // split offsets drawn on the GPU
             );
 
             num_active = new_count;
@@ -278,14 +233,8 @@ void Model::afterTrain(int step){
         }
 
         if (step < stopSplitAt && step % resetInterval == refineEvery){
-            msplat_gpu_sync();
-            constexpr float resetLogit = -1.3862943611198906f;
-            float *op = opacities.data<float>();
-            for (int64_t i = 0; i < opacities.numel(); i++)
-                if (op[i] > resetLogit) op[i] = resetLogit;
-
-            adam_exp_avg[5].zero();
-            adam_exp_avg_sq[5].zero();
+            constexpr float resetLogit = -1.3862943611198906f;  // logit(0.2)
+            msplat_opacity_reset(opacities, adam_exp_avg[5], adam_exp_avg_sq[5], num_active, resetLogit);
             fprintf(stderr, "Opacity reset at step %d\n", step);
         }
 
@@ -331,7 +280,8 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 1;
+// v2 appends the learned sky and exposure state; v1 files still load.
+static constexpr uint32_t CKPT_VERSION = 2;
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -392,6 +342,29 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
 
+    // v2: learned sky
+    uint32_t hasSky = skyTex.defined() ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&hasSky), sizeof(hasSky));
+    if (hasSky) {
+        f.write(reinterpret_cast<const char*>(skyFrame), sizeof(skyFrame));
+        int32_t steps = skySteps;
+        f.write(reinterpret_cast<const char*>(&steps), sizeof(steps));
+        writeTensor(f, skyTex);
+        writeTensor(f, skyExpAvg);
+        writeTensor(f, skyExpAvgSq);
+    }
+    // v2: per-image exposure
+    uint32_t hasExpo = expoParams.defined() ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&hasExpo), sizeof(hasExpo));
+    if (hasExpo) {
+        writeTensor(f, expoParams);
+        writeTensor(f, expoExpAvg);
+        writeTensor(f, expoExpAvgSq);
+        uint32_t n = (uint32_t)expoSteps.size();
+        f.write(reinterpret_cast<const char*>(&n), sizeof(n));
+        f.write(reinterpret_cast<const char*>(expoSteps.data()), n * sizeof(int));
+    }
+
     f.close();
     std::cout << "Checkpoint saved: " << filename << " (step " << step
               << ", " << num_active << " gaussians, "
@@ -407,7 +380,7 @@ int Model::loadCheckpoint(const std::string &filename) {
     f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
     f.read(reinterpret_cast<char*>(&version), sizeof(version));
     if (magic != CKPT_MAGIC) throw std::runtime_error("Not a valid msplat checkpoint file");
-    if (version != CKPT_VERSION) throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
+    if (version < 1 || version > CKPT_VERSION) throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
 
     // Scalar state
     uint32_t step, numPts, shDeg, adamSteps;
@@ -432,6 +405,42 @@ int Model::loadCheckpoint(const std::string &filename) {
     // Optimizer state
     for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg[g] = readTensor(f);
     for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg_sq[g] = readTensor(f);
+
+    // v2: learned sky and exposure. Adopted only when this model was configured with
+    // the same feature and shapes; otherwise skipped, keeping the fresh initialization.
+    if (version >= 2) {
+        uint32_t hasSky = 0;
+        f.read(reinterpret_cast<char*>(&hasSky), sizeof(hasSky));
+        if (hasSky) {
+            float frame[9];
+            int32_t steps = 0;
+            f.read(reinterpret_cast<char*>(frame), sizeof(frame));
+            f.read(reinterpret_cast<char*>(&steps), sizeof(steps));
+            MTensor tex = readTensor(f), ea = readTensor(f), eas = readTensor(f);
+            if (skyTex.defined() && tex.shape() == skyTex.shape()) {
+                skyTex = tex; skyExpAvg = ea; skyExpAvgSq = eas;
+                memcpy(skyFrame, frame, sizeof(skyFrame));
+                skySteps = steps;
+            } else {
+                fprintf(stderr, "Checkpoint has a learned sky this model does not use; skipped\n");
+            }
+        }
+        uint32_t hasExpo = 0;
+        f.read(reinterpret_cast<char*>(&hasExpo), sizeof(hasExpo));
+        if (hasExpo) {
+            MTensor p = readTensor(f), ea = readTensor(f), eas = readTensor(f);
+            uint32_t n = 0;
+            f.read(reinterpret_cast<char*>(&n), sizeof(n));
+            std::vector<int> steps(n);
+            f.read(reinterpret_cast<char*>(steps.data()), n * sizeof(int));
+            if (expoParams.defined() && p.shape() == expoParams.shape()) {
+                expoParams = p; expoExpAvg = ea; expoExpAvgSq = eas;
+                expoSteps = steps;
+            } else {
+                fprintf(stderr, "Checkpoint has exposure parameters this model does not use; skipped\n");
+            }
+        }
+    }
 
     f.close();
 
@@ -477,7 +486,6 @@ int Model::loadCheckpoint(const std::string &filename) {
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
 
@@ -488,12 +496,16 @@ int Model::loadCheckpoint(const std::string &filename) {
 }
 
 Model::CamSetup Model::prepareCam(Camera& cam, int step) {
-    const float sf = getDownscaleFactor(step);
+    const int sf = getDownscaleFactor(step);
     CamSetup s;
-    s.fx = cam.fx / sf; s.fy = cam.fy / sf;
-    s.cx = cam.cx / sf; s.cy = cam.cy / sf;
-    s.height = static_cast<int>(cam.height / sf);
-    s.width = static_cast<int>(cam.width / sf);
+    // Same whole-pixel size as the ground-truth pyramid level (getGPUImage); the
+    // intrinsics follow the actual per-axis ratio, not 1/sf, so odd sizes stay aligned
+    s.width = levelSize(cam.width, sf);
+    s.height = levelSize(cam.height, sf);
+    const float rx = cam.width > 0 ? (float)s.width / (float)cam.width : 1.f / (float)sf;
+    const float ry = cam.height > 0 ? (float)s.height / (float)cam.height : 1.f / (float)sf;
+    s.fx = cam.fx * rx; s.cx = cam.cx * rx;
+    s.fy = cam.fy * ry; s.cy = cam.cy * ry;
 
     float fovX = 2.0f * std::atan(s.width / (2.0f * s.fx));
     float fovY = 2.0f * std::atan(s.height / (2.0f * s.fy));
@@ -533,14 +545,82 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     return s;
 }
 
+// Render-time PriorStep: only the learned sky matters outside training.
+static PriorStep renderPriorStep(Model &m, bool forceAux) {
+    PriorStep p;
+    p.aux = forceAux;
+    if (m.priorOpts.learnSky && m.skyTex.defined()) {
+        p.aux = true;
+        p.sky = true;
+        p.sky_tex = &m.skyTex;
+        p.sky_w = m.priorOpts.skyWidth;
+        p.sky_h = m.priorOpts.skyHeight;
+        memcpy(p.sky_frame, m.skyFrame, sizeof(m.skyFrame));
+    }
+    return p;
+}
+
 MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
+    PriorStep p = renderPriorStep(*this, false);
     return msplat_render(
         means.size(0), means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor);
+        opacities, backgroundColor, p.aux ? &p : nullptr);
+}
+
+// Training-time PriorStep for one camera; advances the sky and exposure Adam step
+// counts, so call exactly once per training step.
+static PriorStep trainPriorStep(Model &m, Camera &cam, int step, float beta1, float beta2) {
+    const PriorOptions &o = m.priorOpts;
+    PriorStep p = renderPriorStep(m, false);
+
+    const bool camPriors = cam.hasPriors();
+    const float depthWeight = (camPriors && cam.priorHasDepth) ? m.depthWeightAt(step) : 0.f;
+    const bool skyTerms = camPriors && cam.priorHasSky && (o.skyAlphaWeight > 0.f || o.fillWeight > 0.f);
+    const bool masks = camPriors && cam.priorHasMask && o.useMasks;
+    p.aux = p.aux || depthWeight > 0.f || skyTerms || masks;
+
+    if (p.sky) {
+        int t = ++m.skySteps;
+        p.sky_grad = &m.skyGrad;
+        p.sky_exp_avg = &m.skyExpAvg;
+        p.sky_exp_avg_sq = &m.skyExpAvgSq;
+        p.sky_step_size = o.skyLr / (1.0f - std::pow(beta1, (float)t));
+        p.sky_bc2_sqrt = std::sqrt(1.0f - std::pow(beta2, (float)t));
+    }
+    if (camPriors) {
+        p.prior_depth = &cam.priorDepth;
+        p.prior_aux = &cam.priorAux;
+        p.prior_w = cam.priorW;
+        p.prior_h = cam.priorH;
+        p.has_depth = cam.priorHasDepth;
+        p.has_sky_mask = cam.priorHasSky;
+    }
+    p.depth_weight = depthWeight;
+    p.sky_weight = o.skyAlphaWeight;
+    p.fill_weight = o.fillWeight;
+    p.huber_delta = o.depthHuberDelta;
+    p.min_alpha = o.depthMinAlpha;
+    p.mask_photometric = o.useMasks;
+    p.loss_terms = &m.priorLossTerms;
+
+    if (o.exposure && m.expoParams.defined() && cam.trainIndex >= 0 && cam.trainIndex < (int)m.expoSteps.size()) {
+        int t = ++m.expoSteps[cam.trainIndex];
+        p.exposure = true;
+        p.cam_index = cam.trainIndex;
+        p.expo_params = &m.expoParams;
+        p.expo_exp_avg = &m.expoExpAvg;
+        p.expo_exp_avg_sq = &m.expoExpAvgSq;
+        p.expo_grad = &m.expoGrad;
+        p.expo_step_size = o.exposureLr / (1.0f - std::pow(beta1, (float)t));
+        p.expo_bc2_sqrt = std::sqrt(1.0f - std::pow(beta2, (float)t));
+        p.expo_reg = o.exposureReg;
+    }
+    if (o.maxScaleRatio > 1.0f) p.log_max_scale_ratio = std::log(o.maxScaleRatio);
+    return p;
 }
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
@@ -580,6 +660,10 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
+    PriorStep prior;
+    const bool usePriors = priorsActive();
+    if (usePriors) prior = trainPriorStep(*this, cam, step, adam_beta1, adam_beta2);
+
     auto [r, loss] = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
@@ -591,7 +675,225 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim);
+        visCounts, xysGradNorm, max2DSize, invMaxDim,
+        usePriors ? &prior : nullptr);
 
     radii = r;
+}
+
+// ── Prior-guided training ───────────────────────────────────────────────────
+
+bool Model::priorsActive() const {
+    const PriorOptions &o = priorOpts;
+    return priorsConfigured &&
+        (o.depthWeight > 0.f || o.skyAlphaWeight > 0.f || o.fillWeight > 0.f || o.useMasks ||
+         o.learnSky || o.exposure || o.maxScaleRatio > 1.0f);
+}
+
+float Model::depthWeightAt(int step) const {
+    float w0 = priorOpts.depthWeight, w1 = priorOpts.depthWeightFinal;
+    if (w0 <= 0.f) return 0.f;
+    if (w1 < 0.f) return w0;
+    float t = std::clamp((float)step / (float)std::max(1, maxSteps), 0.f, 1.f);
+    if (w1 == 0.f) return w0 * (1.f - t);
+    return std::exp(std::log(w0) * (1.f - t) + std::log(w1) * t);
+}
+
+// Equirect frame for the sky: zenith = mean camera up, azimuth 0 = mean heading.
+static void computeSkyFrame(const std::vector<Camera> &cams, float frame[9]) {
+    double up[3] = {}, fwd[3] = {};
+    for (auto &cam : cams) {
+        const float *M = cam.camToWorld;  // OpenGL: columns are camera X, Y (up), Z (back)
+        for (int k = 0; k < 3; k++) {
+            up[k] += M[k * 4 + 1];
+            fwd[k] -= M[k * 4 + 2];
+        }
+    }
+    auto norm = [](double v[3]) {
+        double n = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        if (n < 1e-12) return false;
+        for (int k = 0; k < 3; k++) v[k] /= n;
+        return true;
+    };
+    if (!norm(up)) { up[0] = 0; up[1] = 1; up[2] = 0; }
+    double d = fwd[0] * up[0] + fwd[1] * up[1] + fwd[2] * up[2];
+    for (int k = 0; k < 3; k++) fwd[k] -= d * up[k];
+    if (!norm(fwd)) {
+        // Heading parallel to up: take the world axis least aligned with up
+        int a = 0;
+        for (int k = 1; k < 3; k++) if (std::abs(up[k]) < std::abs(up[a])) a = k;
+        double e[3] = {0, 0, 0};
+        e[a] = 1;
+        d = e[0] * up[0] + e[1] * up[1] + e[2] * up[2];
+        for (int k = 0; k < 3; k++) fwd[k] = e[k] - d * up[k];
+        norm(fwd);
+    }
+    double e2[3] = {up[1] * fwd[2] - up[2] * fwd[1], up[2] * fwd[0] - up[0] * fwd[2], up[0] * fwd[1] - up[1] * fwd[0]};
+    for (int k = 0; k < 3; k++) {
+        frame[k] = (float)up[k];
+        frame[3 + k] = (float)fwd[k];
+        frame[6 + k] = (float)e2[k];
+    }
+}
+
+// Initialize the sky texture from the sky-mask pixels of the training images, each
+// splatted to the texel its ray hits (same mapping as sky_uv in the shader). Texels no
+// image saw take the mean of their elevation row, or the nearest row that has data.
+// Reads the GPU-resident images through shared memory: sync first.
+static void initSkyTexture(const std::vector<Camera> &cams, const float frame[9], int W, int H, float *tex) {
+    std::vector<double> sum((size_t)W * H * 3, 0.0), cnt((size_t)W * H, 0.0);
+    double total[3] = {}, totalN = 0;
+    for (auto &cam : cams) {
+        if (!cam.priorHasSky || !cam.image.defined() || !cam.priorAux.defined()) continue;
+        const uint8_t *aux = cam.priorAux.data<uint8_t>();
+        const float *img = cam.image.data<float>();
+        const float *M = cam.camToWorld;
+        int iw = (int)cam.image.size(1), ih = (int)cam.image.size(0);
+        int stride = std::max(1, std::max(iw, ih) / 256);
+        for (int y = 0; y < ih; y += stride) {
+            int qy = std::min(cam.priorH - 1, (int)((y + 0.5f) * cam.priorH / ih));
+            for (int x = 0; x < iw; x += stride) {
+                int qx = std::min(cam.priorW - 1, (int)((x + 0.5f) * cam.priorW / iw));
+                if (aux[4 * (qy * cam.priorW + qx) + 1] < 128) continue;
+                // OpenCV camera ray (x right, y down, z forward) = OpenGL (X, -Y, -Z)
+                float dc[3] = {(x + 0.5f - cam.cx) / cam.fx, (y + 0.5f - cam.cy) / cam.fy, 1.f};
+                float d[3];
+                for (int k = 0; k < 3; k++) d[k] = M[k * 4] * dc[0] - M[k * 4 + 1] * dc[1] - M[k * 4 + 2] * dc[2];
+                float n = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+                float su = (d[0] * frame[0] + d[1] * frame[1] + d[2] * frame[2]) / n;
+                float s1 = d[0] * frame[3] + d[1] * frame[4] + d[2] * frame[5];
+                float s2 = d[0] * frame[6] + d[1] * frame[7] + d[2] * frame[8];
+                float el = std::asin(std::clamp(su, -1.f, 1.f));
+                float az = std::atan2(s2, s1);
+                int u = (int)std::floor((az / (2.0f * (float)M_PI) + 0.5f) * W);
+                int v = (int)std::floor((0.5f - el / (float)M_PI) * H);
+                u = ((u % W) + W) % W;
+                v = std::clamp(v, 0, H - 1);
+                const float *c = &img[3 * ((size_t)y * iw + x)];
+                size_t t = (size_t)v * W + u;
+                for (int k = 0; k < 3; k++) { sum[3 * t + k] += c[k]; total[k] += c[k]; }
+                cnt[t] += 1;
+                totalN += 1;
+            }
+        }
+    }
+    float mean[3] = {0.6f, 0.7f, 0.85f};  // overcast-ish default when no sky was seen
+    if (totalN > 0) for (int k = 0; k < 3; k++) mean[k] = (float)(total[k] / totalN);
+
+    std::vector<int> rowHas(H, 0);
+    std::vector<float> rowMean((size_t)H * 3, 0.f);
+    for (int v = 0; v < H; v++) {
+        double s[3] = {}, n = 0;
+        for (int u = 0; u < W; u++) {
+            size_t t = (size_t)v * W + u;
+            for (int k = 0; k < 3; k++) s[k] += sum[3 * t + k];
+            n += cnt[t];
+        }
+        if (n > 0) {
+            rowHas[v] = 1;
+            for (int k = 0; k < 3; k++) rowMean[3 * v + k] = (float)(s[k] / n);
+        }
+    }
+    for (int v = 0; v < H; v++) {
+        const float *fill = mean;
+        for (int dv = 0; dv < H; dv++) {
+            if (v - dv >= 0 && rowHas[v - dv]) { fill = &rowMean[3 * (v - dv)]; break; }
+            if (v + dv < H && rowHas[v + dv]) { fill = &rowMean[3 * (v + dv)]; break; }
+        }
+        for (int u = 0; u < W; u++) {
+            size_t t = (size_t)v * W + u;
+            for (int k = 0; k < 3; k++)
+                tex[3 * t + k] = cnt[t] > 0 ? (float)(sum[3 * t + k] / cnt[t]) : fill[k];
+        }
+    }
+}
+
+void Model::configurePriors(const PriorOptions &opts, std::vector<Camera> &trainCams) {
+    priorOpts = opts;
+    priorsConfigured = true;
+    for (size_t i = 0; i < trainCams.size(); i++) trainCams[i].trainIndex = (int)i;
+
+    const bool wantsPriorFiles = opts.depthWeight > 0.f || opts.skyAlphaWeight > 0.f ||
+        opts.fillWeight > 0.f || opts.useMasks || opts.learnSky;
+    numPriorCameras = numDepthCameras = numSkyCameras = numMaskCameras = 0;
+    if (wantsPriorFiles) {
+        for (auto &cam : trainCams) {
+            if (!cam.hasPriorFiles()) continue;
+            cam.loadPriors(scale, opts.useMasks);
+            if (!cam.hasPriors()) continue;
+            numPriorCameras++;
+            numDepthCameras += cam.priorHasDepth ? 1 : 0;
+            numSkyCameras += cam.priorHasSky ? 1 : 0;
+            numMaskCameras += cam.priorHasMask ? 1 : 0;
+        }
+        fprintf(stderr, "Priors: %d/%zu train cameras (depth %d, sky mask %d, mask %d)\n",
+                numPriorCameras, trainCams.size(), numDepthCameras, numSkyCameras, numMaskCameras);
+        if (opts.depthWeight > 0.f && numDepthCameras == 0)
+            fprintf(stderr, "WARNING: depth prior weight is set but no camera has a depth prior "
+                            "(run msplat-prior, or pass --prior-dir)\n");
+        if ((opts.skyAlphaWeight > 0.f || opts.fillWeight > 0.f) && numSkyCameras == 0)
+            fprintf(stderr, "WARNING: sky/fill weights are set but no camera has a sky mask\n");
+    }
+
+    if (opts.learnSky) {
+        if (opts.skyWidth < 4 || opts.skyHeight < 2)
+            throw std::invalid_argument("sky texture must be at least 4x2");
+        computeSkyFrame(trainCams, skyFrame);
+        skyTex = gpu_empty({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
+        msplat_gpu_sync();  // images finish loading on the GPU
+        initSkyTexture(trainCams, skyFrame, opts.skyWidth, opts.skyHeight, skyTex.data<float>());
+        skyGrad = gpu_zeros({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
+        skyExpAvg = gpu_zeros({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
+        skyExpAvgSq = gpu_zeros({opts.skyHeight, opts.skyWidth, 3}, DType::Float32);
+        skySteps = 0;
+    }
+
+    if (opts.exposure && !trainCams.empty()) {
+        int64_t n = (int64_t)trainCams.size();
+        expoParams = gpu_zeros({n, 12}, DType::Float32);
+        float *p = expoParams.data<float>();
+        for (int64_t i = 0; i < n; i++) p[12 * i + 0] = p[12 * i + 4] = p[12 * i + 8] = 1.f;
+        expoExpAvg = gpu_zeros({n, 12}, DType::Float32);
+        expoExpAvgSq = gpu_zeros({n, 12}, DType::Float32);
+        expoGrad = gpu_zeros({12}, DType::Float32);
+        expoSteps.assign((size_t)n, 0);
+    }
+
+    priorLossTerms = gpu_zeros({4}, DType::Float32);
+}
+
+void Model::renderDepth(Camera& cam, int step, MTensor &depthOut, MTensor &alphaOut) {
+    auto s = prepareCam(cam, step);
+    PriorStep p = renderPriorStep(*this, true);
+    msplat_render(
+        means.size(0), means, scales, 1.0f,
+        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        s.height, s.width, s.tileBounds, 0.01f,
+        s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
+        opacities, backgroundColor, &p);
+    MTensor d, t;
+    msplat_render_aux_outputs(d, t);
+    depthOut = gpu_empty({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
+    alphaOut = gpu_empty({(int64_t)s.height, (int64_t)s.width}, DType::Float32);
+    // normalized scene → dataset units
+    msplat_finalize_depth(d, t, (uint32_t)s.height * s.width, 1.f / scale, depthOut, alphaOut);
+    msplat_gpu_sync();
+}
+
+void Model::lastPriorLosses(float out[3]) {
+    out[0] = out[1] = out[2] = 0.f;
+    if (!priorLossTerms.defined()) return;
+    msplat_gpu_sync();
+    const float *p = priorLossTerms.data<float>();
+    for (int k = 0; k < 3; k++) out[k] = p[k];
+}
+
+void Model::saveSky(const std::string &filename) {
+    if (!skyTex.defined()) throw std::runtime_error("No learned sky (enable learn_sky)");
+    msplat_gpu_sync();
+    Image img;
+    img.width = (int)skyTex.size(1);
+    img.height = (int)skyTex.size(0);
+    img.data.assign(skyTex.data<float>(), skyTex.data<float>() + skyTex.numel());
+    imwriteRGB(filename, img);
 }

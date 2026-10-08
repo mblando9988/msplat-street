@@ -35,13 +35,9 @@ endif()
 include(FetchContent)
 FetchContent_Declare(nlohmann_json
     URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.zip)
-set(NANOFLANN_BUILD_EXAMPLES OFF)
-set(NANOFLANN_BUILD_TESTS OFF)
-FetchContent_Declare(nanoflann
-    URL https://github.com/jlblancoc/nanoflann/archive/refs/tags/v1.5.5.zip)
 FetchContent_Declare(cli11
     URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip)
-FetchContent_MakeAvailable(nlohmann_json nanoflann cli11)
+FetchContent_MakeAvailable(nlohmann_json cli11)
 
 # Metal frameworks
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
@@ -81,6 +77,9 @@ add_library(msplat_core STATIC
     core/src/msplat_api.mm
     core/src/model.cpp
     core/src/input_data.cpp
+    core/src/image_sizing.cpp
+    core/src/preflight.cpp
+    core/src/priors.cpp
     core/src/loaders/load_colmap.cpp
     core/src/loaders/load_nerfstudio.cpp
     core/src/loaders/load_polycam.cpp
@@ -101,7 +100,6 @@ target_link_libraries(msplat_core PUBLIC
     ${IMAGEIO_FRAMEWORK}
     ${COREGRAPHICS_FRAMEWORK}
     nlohmann_json::nlohmann_json
-    nanoflann::nanoflann
 )
 target_compile_definitions(msplat_core PRIVATE USE_MPS)
 add_dependencies(msplat_core metallib)

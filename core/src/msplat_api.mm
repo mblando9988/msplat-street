@@ -6,7 +6,6 @@
 #include "model.hpp"
 #include "input_data.hpp"
 #include "msplat.hpp"
-#include "ssim.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -28,9 +27,7 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
-
-    for (auto& cam : impl->data.cameras)
-        cam.loadImage(downscaleFactor);
+    loadCameraImages(impl->data.cameras, downscaleFactor);
 
     if (evalMode) {
         auto split = impl->data.splitTrainTest(testEvery);
@@ -143,18 +140,15 @@ EvalMetrics Trainer::evaluate() {
 
     double sumPsnr = 0, sumSsim = 0, sumL1 = 0;
     int n = (int)testCams.size();
+    int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
 
     for (int i = 0; i < n; i++) {
         Camera& cam = testCams[i];
         MTensor rgb = impl->model->render(cam, impl->config.iterations);
-        msplat_gpu_sync();
-        MTensor rgbCpu = rgb.cpu();
-        int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
-        MTensor gtCpu = cam.getGPUImage(dsf).cpu();
-
-        sumPsnr += psnr(rgbCpu, gtCpu);
-        sumSsim += ssim_eval(rgbCpu, gtCpu);
-        sumL1 += l1_loss(rgbCpu, gtCpu);
+        ImageMetrics m = imageMetrics(rgb, cam.getGPUImage(dsf));
+        sumPsnr += m.psnr;
+        sumSsim += m.ssim;
+        sumL1 += m.l1;
     }
 
     EvalMetrics m;
@@ -174,13 +168,12 @@ PixelBuffer Trainer::render(int cameraIndex, bool useTest) {
     Camera& cam = cams[cameraIndex];
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
-    MTensor rgbCpu = rgb.cpu();
 
-    int h = (int)rgbCpu.size(0);
-    int w = (int)rgbCpu.size(1);
+    int h = (int)rgb.size(0);
+    int w = (int)rgb.size(1);
     // Use malloc so callers can free() — PixelBuffer destructor handles both
     float* buf = (float*)malloc(h * w * 3 * sizeof(float));
-    memcpy(buf, rgbCpu.data_ptr(), h * w * 3 * sizeof(float));
+    memcpy(buf, rgb.data_ptr(), h * w * 3 * sizeof(float));
 
     return PixelBuffer(buf, w, h);
 }
@@ -198,12 +191,11 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
-    MTensor rgbCpu = rgb.cpu();
 
-    int h = (int)rgbCpu.size(0);
-    int w = (int)rgbCpu.size(1);
+    int h = (int)rgb.size(0);
+    int w = (int)rgb.size(1);
     float* buf = (float*)malloc(h * w * 3 * sizeof(float));
-    memcpy(buf, rgbCpu.data_ptr(), h * w * 3 * sizeof(float));
+    memcpy(buf, rgb.data_ptr(), h * w * 3 * sizeof(float));
     return PixelBuffer(buf, w, h);
 }
 
@@ -220,22 +212,14 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     cam.cachedProjViewMat = MTensor();
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
-    msplat_gpu_sync();
 
     int h = (int)rgb.size(0), w = (int)rgb.size(1);
     *outWidth = w;
     *outHeight = h;
-    if (!outRGBA) return;
+    if (!outRGBA) { msplat_gpu_sync(); return; }
 
-    // Read directly from GPU tensor (unified memory on Apple Silicon)
-    const float* src = (const float*)rgb.data_ptr();
-    int n = w * h;
-    for (int i = 0; i < n; i++) {
-        outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
-        outRGBA[i * 4 + 3] = 255;
-    }
+    // RGBA8 packing runs on the GPU right after the render; one copy out
+    msplat_pack_rgba8(rgb, (uint32_t)(w * h), outRGBA);
 }
 
 void Trainer::exportPly(const std::string& path) {

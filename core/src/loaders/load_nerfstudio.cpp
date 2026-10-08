@@ -15,6 +15,25 @@ static std::string resolveImagePath(const std::string &path) {
     return path;
 }
 
+// Relative frame paths ("images/x.png", "./images/x.png", "../x.png") are relative to
+// the transforms.json directory, per the Nerfstudio format. Paths that only exist
+// relative to the working directory still resolve, as they did before 1.2.
+static std::string resolveFramePath(const fs::path &root, const std::string &fp) {
+    fs::path p(fp);
+    if (p.is_absolute()) return resolveImagePath(fp);
+    std::string underRoot = resolveImagePath((root / p).lexically_normal().string());
+    if (fs::exists(underRoot)) return underRoot;
+    std::string underCwd = resolveImagePath(fp);
+    return fs::exists(underCwd) ? underCwd : underRoot;
+}
+
+// Prior file keys written by msplat-prior. Absent keys leave the path empty.
+static std::string priorPath(const json &frame, const char *key, const fs::path &root) {
+    if (!frame.contains(key) || !frame[key].is_string()) return "";
+    fs::path p(frame[key].get<std::string>());
+    return (p.is_absolute() ? p : (root / p).lexically_normal()).string();
+}
+
 InputData loaders::loadNerfstudio(const std::string &projectRoot) {
     std::ifstream f((fs::path(projectRoot) / "transforms.json").string());
     json j = json::parse(f);
@@ -37,10 +56,17 @@ InputData loaders::loadNerfstudio(const std::string &projectRoot) {
         cam.k3 = frame.value("k3", gK3);
         cam.p1 = frame.value("p1", gP1);     cam.p2 = frame.value("p2", gP2);
 
+        fs::path root(projectRoot);
         std::string fp = frame["file_path"].get<std::string>();
-        cam.filePath = (fp[0] == '/' || fp[0] == '.')
-            ? resolveImagePath(fp)
-            : resolveImagePath((fs::path(projectRoot) / fp).string());
+        cam.filePath = resolveFramePath(root, fp);
+        cam.imageName = fs::path(fp).lexically_normal().string();
+
+        // Optional priors (msplat-prior); mask_path follows the Nerfstudio convention
+        // (zero = ignore pixel).
+        cam.priorDepthPath = priorPath(frame, "prior_depth_path", root);
+        cam.priorConfidencePath = priorPath(frame, "prior_confidence_path", root);
+        cam.priorSkyPath = priorPath(frame, "prior_sky_mask_path", root);
+        cam.priorMaskPath = priorPath(frame, "mask_path", root);
 
         // transform_matrix is 4x4 c2w (OpenGL convention)
         auto &tm = frame["transform_matrix"];

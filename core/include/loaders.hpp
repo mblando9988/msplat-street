@@ -18,18 +18,10 @@ Points readColmapPoints(const std::string &path);
 
 // Image I/O
 Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
-Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
-// Undistortion (Brown-Conrady model, alpha=0 crop)
-struct UndistortResult {
-    Image image;
-    float fx, fy, cx, cy;  // updated intrinsics after crop
-    int width, height;      // cropped dimensions
-};
-UndistortResult undistortImage(const Image &src,
-    float fx, float fy, float cx, float cy,
-    float k1, float k2, float p1, float p2, float k3);
+RGBA8Image imreadRGBA8(const std::string &path);  // decoded into GPU-visible memory
+ImageFileInfo probeImage(const std::string &path);  // header only: size, orientation, EXIF size
 
 // Pose utilities
 void autoScaleAndCenter(InputData &data);

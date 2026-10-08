@@ -3482,6 +3482,30 @@ kernel void ssim_v_bwd_kernel(
 #define DENSIFY_SPLIT   1
 #define DENSIFY_DUP     2
 
+// Counter-based RNG: each (seed, counter) pair hashes to an independent value, so
+// kernels draw random numbers in place instead of reading a CPU-filled buffer.
+inline uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Uniform in (0, 1): 24 random bits, offset by half a step so log() never sees 0.
+inline float rand_uniform(uint seed, uint counter) {
+    uint h = pcg_hash(seed ^ pcg_hash(counter));
+    return ((float)(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+}
+
+// Three independent standard normals for stream `stream` (Box-Muller, 4 uniforms).
+inline float3 rand_normal3(uint seed, uint stream) {
+    uint c = stream * 4u;
+    float u0 = rand_uniform(seed, c), u1 = rand_uniform(seed, c + 1u);
+    float u2 = rand_uniform(seed, c + 2u), u3 = rand_uniform(seed, c + 3u);
+    float r0 = sqrt(-2.0f * log(u0)), r1 = sqrt(-2.0f * log(u2));
+    float t0 = 2.0f * M_PI_F * u1, t1 = 2.0f * M_PI_F * u3;
+    return float3(r0 * cos(t0), r0 * sin(t0), r1 * cos(t1));
+}
+
 // Classify each gaussian as split, dup, or nothing based on gradient and scale thresholds.
 kernel void densify_classify_kernel(
     constant int& N,
@@ -3522,11 +3546,12 @@ kernel void densify_classify_kernel(
 // Append split children into backing buffers. One thread per original gaussian.
 // Each split gaussian produces 2 children at [N + 2*(ord)], [N + 2*(ord)+1].
 // Also shrinks parent scale by 1/1.6 and zeros optimizer state for children.
+// Child offsets are N(0, parent scale) draws from the in-kernel RNG, one stream per child.
 kernel void densify_append_split_kernel(
     constant int& N,
     constant int* split_flag         [[buffer(1)]],
     constant int* split_prefix       [[buffer(2)]],  // inclusive prefix sum
-    constant float* random_samples   [[buffer(3)]],  // [2*N, 3] randn
+    constant uint& seed              [[buffer(3)]],  // per-densification RNG seed
     constant float& log_size_fac     [[buffer(4)]],  // log(1.6)
     device float* means_buf          [[buffer(5)]],
     device float* scales_buf         [[buffer(6)]],
@@ -3567,12 +3592,12 @@ kernel void densify_append_split_kernel(
     // For each of 2 children
     for (int k = 0; k < 2; k++) {
         int child = (k == 0) ? c0 : c1;
-        int rand_idx = ord * 2 + k;
 
-        // Scale random sample by parent scale
-        float r0 = random_samples[rand_idx*3]   * sx;
-        float r1 = random_samples[rand_idx*3+1] * sy;
-        float r2 = random_samples[rand_idx*3+2] * sz;
+        // Standard-normal sample scaled by parent scale
+        float3 n = rand_normal3(seed, (uint)(ord * 2 + k));
+        float r0 = n.x * sx;
+        float r1 = n.y * sy;
+        float r2 = n.z * sz;
 
         // Rotate by parent quaternion: v' = R @ v
         float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
@@ -3749,4 +3774,1217 @@ kernel void zero_buffer_kernel(
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx < count) buf[idx] = 0;
+}
+
+// ============================================================================
+// Prior-guided training
+//
+// Street-view and other sparse, forward-moving captures leave 3DGS free to put a
+// gaussian anywhere along each ray. These kernels add the terms that pin geometry
+// to a feed-forward prior (msplat-prior / VGGT depth), a direction-dependent sky,
+// per-image exposure, and a cap on needle-shaped gaussians. None of them run in the
+// default training path: the host dispatches them only when a prior option is on.
+//
+// The *_aux rasterizers are monolithic-path copies of nd_rasterize_forward_kernel and
+// rasterize_backward_kernel that also composite expected depth D = sum w_i z_i and
+// read a per-pixel background (the learned sky). Accumulated alpha is 1 - final_T.
+// ============================================================================
+
+// Must match PriorSkyParams in msplat_metal.mm.
+struct SkyParams {
+    float up[3];        // sky frame: zenith
+    float e1[3];        //            azimuth 0
+    float e2[3];        //            azimuth +90 deg
+    float fx;
+    float fy;
+    float cx;
+    float cy;
+    uint tex_w;         // equirect texture, (tex_h, tex_w, 3)
+    uint tex_h;
+    uint enabled;       // 0: background is the constant color
+    uint pad;
+};
+
+// World-space direction of the ray through pixel (px, py). The rasterizer samples
+// pixel j at x_pix = fx * x / z + cx - 0.5, so its ray has x / z = (j + 0.5 - cx) / fx.
+// viewmat is world-to-camera (OpenCV), so camera-to-world rotation is its transpose.
+inline float3 pixel_world_dir(float px, float py, constant float* viewmat, constant SkyParams& sky) {
+    float dx = (px + 0.5f - sky.cx) / sky.fx;
+    float dy = (py + 0.5f - sky.cy) / sky.fy;
+    return float3(viewmat[0] * dx + viewmat[4] * dy + viewmat[8],
+                  viewmat[1] * dx + viewmat[5] * dy + viewmat[9],
+                  viewmat[2] * dx + viewmat[6] * dy + viewmat[10]);
+}
+
+// Equirect texel coordinates (texel centers at integers) for a world direction.
+inline float2 sky_uv(float3 d, constant SkyParams& sky) {
+    float3 up = float3(sky.up[0], sky.up[1], sky.up[2]);
+    float3 e1 = float3(sky.e1[0], sky.e1[1], sky.e1[2]);
+    float3 e2 = float3(sky.e2[0], sky.e2[1], sky.e2[2]);
+    d = normalize(d);
+    float el = asin(clamp(dot(d, up), -1.f, 1.f));
+    float az = atan2(dot(d, e2), dot(d, e1));
+    float u = (az * (0.5f / M_PI_F) + 0.5f) * (float)sky.tex_w - 0.5f;
+    float v = (0.5f - el / M_PI_F) * (float)sky.tex_h - 0.5f;
+    return float2(u, v);
+}
+
+// Bilinear taps: azimuth wraps, elevation clamps.
+struct SkyTaps {
+    uint idx[4];
+    float w[4];
+};
+
+inline SkyTaps sky_taps(float2 uv, uint tex_w, uint tex_h) {
+    float u0f = floor(uv.x);
+    float fu = uv.x - u0f;
+    int u0 = (int)u0f % (int)tex_w;
+    if (u0 < 0) u0 += (int)tex_w;
+    int u1 = (u0 + 1) % (int)tex_w;
+    float vc = clamp(uv.y, 0.f, (float)tex_h - 1.f);
+    int v0 = (int)vc;
+    int v1 = min(v0 + 1, (int)tex_h - 1);
+    float fv = vc - (float)v0;
+    SkyTaps t;
+    t.idx[0] = (uint)(v0 * (int)tex_w + u0); t.w[0] = (1.f - fu) * (1.f - fv);
+    t.idx[1] = (uint)(v0 * (int)tex_w + u1); t.w[1] = fu * (1.f - fv);
+    t.idx[2] = (uint)(v1 * (int)tex_w + u0); t.w[2] = (1.f - fu) * fv;
+    t.idx[3] = (uint)(v1 * (int)tex_w + u1); t.w[3] = fu * fv;
+    return t;
+}
+
+inline float3 sky_sample(constant float* tex, float2 uv, uint tex_w, uint tex_h) {
+    SkyTaps t = sky_taps(uv, tex_w, tex_h);
+    float3 c = {0.f, 0.f, 0.f};
+    for (int k = 0; k < 4; k++) c = fma(float3(t.w[k]), read_packed_float3(tex, (int)t.idx[k]), c);
+    return c;
+}
+
+kernel void rasterize_forward_aux_kernel(
+    constant uint3& tile_bounds             [[buffer(0)]],
+    constant uint3& img_size                [[buffer(1)]],
+    constant int* tile_bins                 [[buffer(2)]],  // int2
+    constant float* packed_xy_opac          [[buffer(3)]],  // float3: (x, y, sigmoid(opacity))
+    constant float* packed_conic            [[buffer(4)]],  // float3
+    constant float* packed_rgb              [[buffer(5)]],  // float3: raw SH (NOT clamped)
+    constant int32_t* gaussian_ids_sorted   [[buffer(6)]],
+    constant float* depths                  [[buffer(7)]],  // per-gaussian view-space z
+    device float* final_Ts                  [[buffer(8)]],
+    device int* final_index                 [[buffer(9)]],
+    device float* out_img                   [[buffer(10)]],
+    device float* out_depth                 [[buffer(11)]], // (H, W): sum_i w_i z_i
+    device float* bg_img                    [[buffer(12)]], // (H, W, 3): background behind each pixel
+    constant float* background              [[buffer(13)]], // constant color, used when the sky is off
+    constant float* sky_tex                 [[buffer(14)]], // (tex_h, tex_w, 3)
+    constant SkyParams& sky                 [[buffer(15)]],
+    constant float* viewmat                 [[buffer(16)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    int32_t i = blockIdx.y * RAST_BLOCK_Y + threadIdx.y;
+    int32_t j = blockIdx.x * RAST_BLOCK_X + threadIdx.x;
+    // Map pixel coords back to parent 16x16 tile for tile_bins lookup
+    int32_t tile_id = (i / BLOCK_Y) * (int)tile_bounds.x + (j / BLOCK_X);
+    float px = (float)j;
+    float py = (float)i;
+    int32_t pix_id = i * (int)img_size.x + j;
+    const bool inside = (i < (int)img_size.y && j < (int)img_size.x);
+
+    int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float depth_batch[RAST_BLOCK_SIZE];
+
+    float T = 1.f;
+    float3 pix_out = {0.f, 0.f, 0.f};
+    float depth_out = 0.f;
+    int last_contributor = range.x - 1;
+    bool done = false;
+
+    for (int b = 0; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int idx = batch_start + tr;
+        if (idx < range.y) {
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            rgbs_batch[tr] = max(read_packed_float3(packed_rgb, idx) + 0.5f, 0.0f);
+            depth_batch[tr] = depths[gaussian_ids_sorted[idx]];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (done || !inside) continue;
+
+        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        for (int t = 0; t < batch_size; ++t) {
+            const float3 conic_local = conic_batch[t];
+            const float3 xy_opac = xy_opacity_batch[t];
+            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+            const float sigma = fma(0.5f,
+                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                conic_local.y * delta.x * delta.y);
+            if (sigma < 0.f || sigma >= 5.55f) continue;
+            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+            if (alpha < 1.f / 255.f) continue;
+            const float next_T = T * (1.f - alpha);
+            if (next_T <= 1e-4f) {
+                last_contributor = batch_start + t - 1;
+                done = true;
+                break;
+            }
+            const float vis = alpha * T;
+            pix_out = fma(rgbs_batch[t], vis, pix_out);
+            depth_out = fma(depth_batch[t], vis, depth_out);
+            T = next_T;
+            last_contributor = batch_start + t;
+        }
+    }
+
+    if (inside) {
+        float3 bg;
+        if (sky.enabled) {
+            float3 d = pixel_world_dir(px, py, viewmat, sky);
+            bg = sky_sample(sky_tex, sky_uv(d, sky), sky.tex_w, sky.tex_h);
+        } else {
+            bg = float3(background[0], background[1], background[2]);
+        }
+        final_Ts[pix_id] = T;
+        final_index[pix_id] = last_contributor;
+        out_depth[pix_id] = depth_out;
+        write_packed_float3(bg_img, pix_id, bg);
+        write_packed_float3(out_img, pix_id, saturate(fma(bg, T, pix_out)));
+    }
+}
+
+// Back-to-front walk of rasterize_backward_kernel with two extra channels: depth
+// (value z_i, background 0) and alpha (value 1, background 0). Their per-pixel
+// cotangents come from prior_loss_kernel in v_aux. dL/dz_i accumulates in v_depth,
+// which project_and_sh_backward_kernel already folds into v_mean3d.
+kernel void rasterize_backward_aux_kernel(
+    constant uint3& tile_bounds             [[buffer(0)]],
+    constant uint2& img_size                [[buffer(1)]],
+    constant int32_t* gaussian_ids_sorted   [[buffer(2)]],
+    constant int* tile_bins                 [[buffer(3)]],  // int2
+    constant float* packed_xy_opac          [[buffer(4)]],
+    constant float* packed_conic            [[buffer(5)]],
+    constant float* packed_rgb              [[buffer(6)]],
+    constant float* depths                  [[buffer(7)]],
+    constant float* bg_img                  [[buffer(8)]],  // (H, W, 3) from the forward
+    constant float* final_Ts                [[buffer(9)]],
+    constant int* final_index               [[buffer(10)]],
+    constant float* v_output                [[buffer(11)]], // (H, W, 3)
+    constant float* v_aux                   [[buffer(12)]], // (H, W, 2): dL/dD, dL/dA
+    device atomic_float* v_xy               [[buffer(13)]], // float2
+    device atomic_float* v_conic            [[buffer(14)]], // float3
+    device atomic_float* v_rgb              [[buffer(15)]], // float3
+    device atomic_float* v_opacity          [[buffer(16)]],
+    device atomic_float* v_depth            [[buffer(17)]],
+    uint3 gp [[thread_position_in_grid]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint warp_size [[threads_per_simdgroup]],
+    uint wr [[thread_index_in_simdgroup]]
+) {
+    uint i = gp.y;
+    uint j = gp.x;
+    int32_t tile_id = ((int)i / BLOCK_Y) * tile_bounds.x + ((int)j / BLOCK_X);
+
+    const float px = (float)j;
+    const float py = (float)i;
+    const int32_t pix_id = min((int32_t)(i * img_size.x + j), (int32_t)(img_size.x * img_size.y - 1));
+    const bool inside = (i < img_size.y && j < img_size.x);
+
+    float T_final = final_Ts[pix_id];
+    float T = T_final;
+    float3 buffer = {0.f, 0.f, 0.f};
+    float buffer_d = 0.f;
+    float buffer_a = 0.f;
+    const int bin_final = inside ? final_index[pix_id] : 0;
+
+    const int2 range = read_packed_int2(tile_bins, tile_id);
+    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+
+    threadgroup int32_t id_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
+    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup float depth_batch[RAST_BLOCK_SIZE];
+
+    const float3 v_out = read_packed_float3(v_output, pix_id);
+    const float v_d = v_aux[2 * pix_id];
+    const float v_a = v_aux[2 * pix_id + 1];
+    const float3 T_final_bg = T_final * read_packed_float3(bg_img, pix_id);
+
+    const int warp_bin_final = warp_reduce_all_max(bin_final, warp_size);
+
+    // Subtile-level early exit (see rasterize_backward_kernel)
+    const uint warp_id = tr / warp_size;
+    constexpr uint NUM_WARPS = RAST_BLOCK_SIZE / 32;
+    threadgroup int warp_max_finals[NUM_WARPS];
+    if (wr == 0) warp_max_finals[warp_id] = warp_bin_final;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int tile_max_bin_final = warp_max_finals[0];
+    for (uint w = 1; w < NUM_WARPS; w++)
+        tile_max_bin_final = max(tile_max_bin_final, warp_max_finals[w]);
+    int dead_count = max(0, (int)(range.y - 1) - tile_max_bin_final);
+    int first_batch = dead_count / RAST_BLOCK_SIZE;
+
+    for (int b = first_batch; b < num_batches; ++b) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int batch_end = range.y - 1 - RAST_BLOCK_SIZE * b;
+        int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - range.x);
+        const int idx = batch_end - tr;
+        if (idx >= range.x) {
+            int32_t g_id = gaussian_ids_sorted[idx];
+            id_batch[tr] = g_id;
+            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
+            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
+            depth_batch[tr] = depths[g_id];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
+            float3 b_conic, b_xy_opac, b_rgb;
+            float b_z;
+            int32_t b_id;
+            if (wr == 0) {
+                b_conic = conic_batch[t];
+                b_xy_opac = xy_opacity_batch[t];
+                b_rgb = rgbs_batch[t];
+                b_z = depth_batch[t];
+                b_id = id_batch[t];
+            }
+            b_conic = simd_broadcast(b_conic, 0);
+            b_xy_opac = simd_broadcast(b_xy_opac, 0);
+            b_rgb = simd_broadcast(b_rgb, 0);
+            b_z = simd_broadcast(b_z, 0);
+            b_id = simd_broadcast(b_id, 0);
+
+            int valid = inside;
+            if (batch_end - t > bin_final) valid = 0;
+            float alpha;
+            float opac;
+            float2 delta;
+            if (valid) {
+                opac = b_xy_opac.z;
+                delta = {b_xy_opac.x - px, b_xy_opac.y - py};
+                float sigma = fma(0.5f,
+                    fma(b_conic.x, delta.x * delta.x, b_conic.z * delta.y * delta.y),
+                    b_conic.y * delta.x * delta.y);
+                if (sigma < 0.f || sigma >= 5.55f) {
+                    valid = 0;
+                } else {
+                    alpha = min(0.999f, opac * exp(-sigma));
+                    if (alpha < 1.f / 255.f) valid = 0;
+                }
+            }
+            if (!warp_reduce_all_or(valid, warp_size)) continue;
+
+            float3 v_rgb_local = {0.f, 0.f, 0.f};
+            float3 v_conic_local = {0.f, 0.f, 0.f};
+            float2 v_xy_local = {0.f, 0.f};
+            float v_opacity_local = 0.f;
+            float v_depth_local = 0.f;
+            if (valid) {
+                float ra = 1.f / (1.f - alpha);
+                T *= ra;
+                const float fac = alpha * T;
+                v_rgb_local = fac * v_out;
+
+                const float3 rgb = max(b_rgb + 0.5f, 0.f);
+                float v_alpha = dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                // Depth and alpha channels: value z (or 1) for this gaussian, 0 behind the last one.
+                v_alpha += (b_z * T - buffer_d * ra) * v_d + (T - buffer_a * ra) * v_a;
+                buffer = fma(rgb, fac, buffer);
+                buffer_d = fma(b_z, fac, buffer_d);
+                buffer_a += fac;
+                v_depth_local = fac * v_d;
+
+                if (alpha < 0.999f) {
+                    const float v_sigma = -alpha * v_alpha;
+                    v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
+                                                               delta.x * delta.y,
+                                                               delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                }
+            }
+
+            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
+            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
+            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
+            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
+            v_depth_local = warpSum(v_depth_local, warp_size, wr);
+
+            if (wr == 0) {
+                if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
+                if (b_rgb.y + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
+                if (b_rgb.z + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+                atomic_fetch_add_explicit(v_depth + b_id, v_depth_local, memory_order_relaxed);
+            }
+        }
+    }
+}
+
+// Must match PriorLossParams in msplat_metal.mm.
+struct PriorLossParams {
+    uint img_w;
+    uint img_h;
+    uint prior_w;           // priors stay at their native resolution and are
+    uint prior_h;           // sampled by normalized pixel position
+    float depth_weight;     // already scheduled for this step
+    float sky_weight;
+    float fill_weight;
+    float huber_delta;      // in log-depth units
+    float min_alpha;        // depth is only supervised where accumulated alpha exceeds this
+    float inv_npix;         // 1 / (img_w * img_h)
+    uint has_depth;
+    uint has_sky_mask;      // the fill term needs a sky mask to know where not to fill
+    uint mask_photo;        // zero the photometric gradient where the keep mask is 0
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+// Bilinear prior depth that refuses to invent a surface between a foreground and a
+// background tap: at a depth edge or an invalid (0) tap it returns the nearest tap.
+inline float sample_prior_depth(constant float* d, float x, float y, uint w, uint h) {
+    x = clamp(x, 0.f, (float)w - 1.f);
+    y = clamp(y, 0.f, (float)h - 1.f);
+    uint x0 = (uint)x, y0 = (uint)y;
+    uint x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+    float fx = x - (float)x0, fy = y - (float)y0;
+    float d00 = d[y0 * w + x0], d01 = d[y0 * w + x1];
+    float d10 = d[y1 * w + x0], d11 = d[y1 * w + x1];
+    float lo = min(min(d00, d01), min(d10, d11));
+    float hi = max(max(d00, d01), max(d10, d11));
+    if (lo <= 0.f || hi > 1.05f * lo) {
+        uint nx = (fx < 0.5f) ? x0 : x1;
+        uint ny = (fy < 0.5f) ? y0 : y1;
+        return d[ny * w + nx];
+    }
+    return mix(mix(d00, d01, fx), mix(d10, d11, fx), fy);
+}
+
+// Per-pixel prior losses -> cotangents of D (expected depth numerator) and A
+// (accumulated alpha) for rasterize_backward_aux_kernel:
+//   depth: Huber(log(D / A) - log(d_prior)) * confidence, on non-sky pixels with A > min_alpha
+//   sky:   A on sky-mask pixels (pushes them transparent so the learned sky shows)
+//   fill:  1 - A on non-sky pixels (keeps the sky from leaking through the foreground)
+// Pixels whose keep mask is 0 (e.g. moving cars) get no prior gradient, and with
+// mask_photo no photometric gradient either. Loss values are summed into loss_terms
+// for logging only.
+kernel void prior_loss_kernel(
+    constant float* out_depth           [[buffer(0)]],  // (H, W)
+    constant float* final_Ts            [[buffer(1)]],  // (H, W)
+    constant float* prior_depth         [[buffer(2)]],  // (prior_h, prior_w), scene units, 0 = invalid
+    constant uchar* prior_aux           [[buffer(3)]],  // (prior_h, prior_w, 4): confidence, sky, keep, unused
+    constant PriorLossParams& p         [[buffer(4)]],
+    device float* v_aux                 [[buffer(5)]],  // (H, W, 2)
+    device float* v_photo               [[buffer(6)]],  // (H, W, 3), masked in place
+    device atomic_float* loss_terms     [[buffer(7)]],  // [0] depth [1] sky [2] fill
+    uint2 gid [[thread_position_in_grid]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    float l_depth = 0.f, l_sky = 0.f, l_fill = 0.f;
+    if (gid.x < p.img_w && gid.y < p.img_h) {
+        uint pix = gid.y * p.img_w + gid.x;
+        float sx = ((float)gid.x + 0.5f) * (float)p.prior_w / (float)p.img_w;
+        float sy = ((float)gid.y + 0.5f) * (float)p.prior_h / (float)p.img_h;
+        uint q = min((uint)sy, p.prior_h - 1) * p.prior_w + min((uint)sx, p.prior_w - 1);
+        float conf = (float)prior_aux[4 * q + 0] * (1.f / 255.f);
+        bool is_sky = p.has_sky_mask && prior_aux[4 * q + 1] >= 128;
+        bool keep = prior_aux[4 * q + 2] >= 128;
+
+        float v_d = 0.f, v_a = 0.f;
+        if (!keep) {
+            if (p.mask_photo) write_packed_float3(v_photo, (int)pix, float3(0.f));
+        } else {
+            float A = 1.f - final_Ts[pix];
+            if (is_sky) {
+                l_sky = p.sky_weight * A;
+                v_a = p.sky_weight * p.inv_npix;
+            } else {
+                if (p.has_sky_mask && p.fill_weight > 0.f) {
+                    l_fill = p.fill_weight * (1.f - A);
+                    v_a -= p.fill_weight * p.inv_npix;
+                }
+                float D = out_depth[pix];
+                if (p.has_depth && p.depth_weight > 0.f && conf > 0.f && A > p.min_alpha && D > 0.f) {
+                    float dp = sample_prior_depth(prior_depth, sx - 0.5f, sy - 0.5f, p.prior_w, p.prior_h);
+                    if (dp > 0.f) {
+                        float r = log(D / A) - log(dp);
+                        float ar = fabs(r);
+                        float dr;
+                        if (ar < p.huber_delta) {
+                            l_depth = p.depth_weight * conf * 0.5f * r * r / p.huber_delta;
+                            dr = r / p.huber_delta;
+                        } else {
+                            l_depth = p.depth_weight * conf * (ar - 0.5f * p.huber_delta);
+                            dr = sign(r);
+                        }
+                        // d/dD log(D/A) = 1/D, d/dA log(D/A) = -1/A
+                        float s = p.depth_weight * conf * dr * p.inv_npix;
+                        v_d = s / D;
+                        v_a -= s / A;
+                    }
+                }
+            }
+        }
+        v_aux[2 * pix] = v_d;
+        v_aux[2 * pix + 1] = v_a;
+    }
+
+    // Threadgroup reduction of the loss values (logging only)
+    threadgroup float partial[3][32];
+    l_depth = simd_sum(l_depth);
+    l_sky = simd_sum(l_sky);
+    l_fill = simd_sum(l_fill);
+    if (lane == 0) {
+        partial[0][sg] = l_depth;
+        partial[1][sg] = l_sky;
+        partial[2][sg] = l_fill;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tr == 0) {
+        uint n_sg = (tg_size.x * tg_size.y + simd_width - 1) / simd_width;
+        float a = 0.f, b = 0.f, c = 0.f;
+        for (uint s = 0; s < n_sg; s++) {
+            a += partial[0][s];
+            b += partial[1][s];
+            c += partial[2][s];
+        }
+        atomic_fetch_add_explicit(&loss_terms[0], a * p.inv_npix, memory_order_relaxed);
+        atomic_fetch_add_explicit(&loss_terms[1], b * p.inv_npix, memory_order_relaxed);
+        atomic_fetch_add_explicit(&loss_terms[2], c * p.inv_npix, memory_order_relaxed);
+    }
+}
+
+// dL/d(sky texel): each pixel's background cotangent is final_T * dL/dC, scattered
+// to its four bilinear taps. Opaque pixels see no sky and are skipped.
+kernel void sky_backward_kernel(
+    constant float* v_rendered          [[buffer(0)]],  // (H, W, 3)
+    constant float* final_Ts            [[buffer(1)]],
+    constant float* viewmat             [[buffer(2)]],
+    constant SkyParams& sky             [[buffer(3)]],
+    constant uint2& img_size            [[buffer(4)]],
+    device atomic_float* sky_grad       [[buffer(5)]],  // (tex_h, tex_w, 3)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= img_size.x || gid.y >= img_size.y) return;
+    uint pix = gid.y * img_size.x + gid.x;
+    float T = final_Ts[pix];
+    if (T < 1e-4f) return;
+    float3 g = T * read_packed_float3(v_rendered, (int)pix);
+    float3 d = pixel_world_dir((float)gid.x, (float)gid.y, viewmat, sky);
+    SkyTaps taps = sky_taps(sky_uv(d, sky), sky.tex_w, sky.tex_h);
+    for (int k = 0; k < 4; k++) {
+        if (taps.w[k] == 0.f) continue;
+        uint base = 3 * taps.idx[k];
+        atomic_fetch_add_explicit(&sky_grad[base + 0], taps.w[k] * g.x, memory_order_relaxed);
+        atomic_fetch_add_explicit(&sky_grad[base + 1], taps.w[k] * g.y, memory_order_relaxed);
+        atomic_fetch_add_explicit(&sky_grad[base + 2], taps.w[k] * g.z, memory_order_relaxed);
+    }
+}
+
+// Per-image affine color transform c' = M c + b (12 floats per camera: M row-major,
+// then b), applied to the render before the photometric loss. It absorbs auto-exposure
+// and white-balance changes between frames so they are not baked into the scene.
+kernel void exposure_apply_kernel(
+    constant float* img                 [[buffer(0)]],  // (H, W, 3)
+    constant float* params              [[buffer(1)]],  // (num_cameras, 12)
+    constant uint& cam                  [[buffer(2)]],
+    constant uint& num_pixels           [[buffer(3)]],
+    device float* out                   [[buffer(4)]],  // (H, W, 3)
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= num_pixels) return;
+    constant float* P = params + 12 * cam;
+    float3 c = read_packed_float3(img, (int)idx);
+    float3 r = float3(dot(float3(P[0], P[1], P[2]), c) + P[9],
+                      dot(float3(P[3], P[4], P[5]), c) + P[10],
+                      dot(float3(P[6], P[7], P[8]), c) + P[11]);
+    write_packed_float3(out, (int)idx, r);
+}
+
+// Backward of exposure_apply_kernel: v_img = M^T v_adj, and the 12 parameter
+// gradients reduced over the image into grad (zeroed by exposure_adam_kernel).
+kernel void exposure_backward_kernel(
+    constant float* img                 [[buffer(0)]],  // (H, W, 3) render before the transform
+    constant float* params              [[buffer(1)]],  // (num_cameras, 12)
+    constant uint& cam                  [[buffer(2)]],
+    constant uint& num_pixels           [[buffer(3)]],
+    constant float* v_adj               [[buffer(4)]],  // (H, W, 3) dL/d(transformed render)
+    device float* v_img                 [[buffer(5)]],  // (H, W, 3) dL/d(render)
+    device atomic_float* grad           [[buffer(6)]],  // [12]
+    uint idx [[thread_position_in_grid]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint tg_threads [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    constant float* P = params + 12 * cam;
+    float g[12];
+    for (int k = 0; k < 12; k++) g[k] = 0.f;
+    if (idx < num_pixels) {
+        float3 c = read_packed_float3(img, (int)idx);
+        float3 v = read_packed_float3(v_adj, (int)idx);
+        write_packed_float3(v_img, (int)idx, float3(
+            P[0] * v.x + P[3] * v.y + P[6] * v.z,
+            P[1] * v.x + P[4] * v.y + P[7] * v.z,
+            P[2] * v.x + P[5] * v.y + P[8] * v.z));
+        g[0] = v.x * c.x; g[1] = v.x * c.y; g[2] = v.x * c.z;
+        g[3] = v.y * c.x; g[4] = v.y * c.y; g[5] = v.y * c.z;
+        g[6] = v.z * c.x; g[7] = v.z * c.y; g[8] = v.z * c.z;
+        g[9] = v.x; g[10] = v.y; g[11] = v.z;
+    }
+    threadgroup float partial[12][32];
+    for (int k = 0; k < 12; k++) {
+        float s = simd_sum(g[k]);
+        if (lane == 0) partial[k][sg] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint n_sg = (tg_threads + simd_width - 1) / simd_width;
+    for (uint k = tr; k < 12; k += tg_threads) {
+        float s = 0.f;
+        for (uint j = 0; j < n_sg; j++) s += partial[k][j];
+        atomic_fetch_add_explicit(&grad[k], s, memory_order_relaxed);
+    }
+}
+
+// Adam on one camera's 12 exposure parameters, with an L2 pull toward the identity
+// transform that fixes the global color gauge. Consumes and zeroes grad.
+kernel void exposure_adam_kernel(
+    device float* params                [[buffer(0)]],  // (num_cameras, 12)
+    device float* exp_avg               [[buffer(1)]],
+    device float* exp_avg_sq            [[buffer(2)]],
+    device float* grad                  [[buffer(3)]],  // [12]
+    constant uint& cam                  [[buffer(4)]],
+    constant float& step_size           [[buffer(5)]],
+    constant float& bc2_sqrt            [[buffer(6)]],
+    constant float& reg                 [[buffer(7)]],
+    constant float& beta1               [[buffer(8)]],
+    constant float& beta2               [[buffer(9)]],
+    constant float& eps                 [[buffer(10)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= 12) return;
+    uint i = 12 * cam + tid;
+    float ident = (tid == 0 || tid == 4 || tid == 8) ? 1.f : 0.f;
+    float g = grad[tid] + reg * (params[i] - ident);
+    grad[tid] = 0.f;
+    adam_update_element(params[i], exp_avg[i], exp_avg_sq[i], g, step_size, beta1, beta2, bc2_sqrt, eps);
+}
+
+// Caps each gaussian's largest scale at max_ratio times its median scale (log space).
+// Needles, long along one axis only, are what forward-moving captures produce along
+// the viewing rays; discs (two large axes) are left alone so flat road surfaces survive.
+kernel void scale_ratio_cap_kernel(
+    device float* scales                [[buffer(0)]],  // (N, 3) log-space
+    constant uint& num_points           [[buffer(1)]],
+    constant float& log_max_ratio       [[buffer(2)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= num_points) return;
+    float a = scales[3 * idx], b = scales[3 * idx + 1], c = scales[3 * idx + 2];
+    float mx = max(a, max(b, c));
+    float mn = min(a, min(b, c));
+    float mid = a + b + c - mx - mn;
+    float cap = mid + log_max_ratio;
+    if (mx <= cap) return;
+    if (a == mx) scales[3 * idx] = cap;
+    else if (b == mx) scales[3 * idx + 1] = cap;
+    else scales[3 * idx + 2] = cap;
+}
+
+// ============================================================================
+// GPU-resident training utilities (formerly host loops)
+// ============================================================================
+
+// Opacity reset: clamp every opacity logit to at most reset_logit and clear the
+// opacity group's Adam moments. Encoded into the training command buffer, so the
+// host neither waits for the GPU nor touches the parameters.
+kernel void opacity_reset_kernel(
+    device float* opacities             [[buffer(0)]],  // (N,) logits
+    device float* exp_avg               [[buffer(1)]],
+    device float* exp_avg_sq            [[buffer(2)]],
+    constant uint& num_points           [[buffer(3)]],
+    constant float& reset_logit         [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= num_points) return;
+    opacities[idx] = min(opacities[idx], reset_logit);
+    exp_avg[idx] = 0.f;
+    exp_avg_sq[idx] = 0.f;
+}
+
+// ============================================================================
+// Exclusive scan and stable LSD radix sort
+// General-purpose primitives used by GPU initialization (Morton ordering for KNN)
+// and depth-prior fusion (voxel keys). Keys are 64-bit; sort only as many 8-bit
+// digits as the keys use. Threadgroups are RS_TG threads owning RS_EPT consecutive
+// slots each, so one threadgroup covers RS_BLOCK elements.
+// ============================================================================
+
+#define RS_TG 256
+#define RS_EPT 4
+#define RS_BLOCK (RS_TG * RS_EPT)
+
+// Exclusive prefix sum of one value per thread across the threadgroup; `total` gets
+// the threadgroup sum. Contains barriers: every thread of the threadgroup must call it.
+inline uint tg_exclusive_scan(uint x, threadgroup uint* sg_sums, uint sg, uint lane,
+                              uint simd_width, uint num_threads, thread uint& total) {
+    uint pre = simd_prefix_exclusive_sum(x);
+    uint s = simd_sum(x);
+    if (lane == 0) sg_sums[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint n_sg = (num_threads + simd_width - 1) / simd_width;
+    uint off = 0, tot = 0;
+    for (uint k = 0; k < n_sg; k++) {
+        uint v = sg_sums[k];
+        if (k < sg) off += v;
+        tot += v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // sg_sums is reused by the next call
+    total = tot;
+    return off + pre;
+}
+
+// Exclusive scan of RS_BLOCK-element blocks in place; each block's sum goes to partials.
+// Scan partials (recursively), then add them back with scan_add_kernel.
+kernel void scan_block_kernel(
+    device uint* data                   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device uint* partials               [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    threadgroup uint sg_sums[32];
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    uint v[RS_EPT];
+    uint s = 0;
+    for (uint j = 0; j < RS_EPT; j++) {
+        v[j] = (base + j < n) ? data[base + j] : 0u;
+        s += v[j];
+    }
+    uint total;
+    uint run = tg_exclusive_scan(s, sg_sums, sg, lane, simd_width, RS_TG, total);
+    for (uint j = 0; j < RS_EPT; j++) {
+        if (base + j < n) data[base + j] = run;
+        run += v[j];
+    }
+    if (tid == 0) partials[block] = total;
+}
+
+kernel void scan_add_kernel(
+    device uint* data                   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device const uint* partials         [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]]
+) {
+    uint add = partials[block];
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    for (uint j = 0; j < RS_EPT; j++)
+        if (base + j < n) data[base + j] += add;
+}
+
+// Per-block histogram of one 8-bit digit, stored digit-major (hist[d * num_blocks + b])
+// so that a single exclusive scan yields every block's global start for every digit.
+kernel void radix_count_kernel(
+    device const ulong* keys            [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    constant uint& shift                [[buffer(2)]],
+    constant uint& num_blocks           [[buffer(3)]],
+    device uint* hist                   [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]]
+) {
+    threadgroup atomic_uint counts[256];
+    atomic_store_explicit(&counts[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    for (uint j = 0; j < RS_EPT; j++) {
+        if (base + j < n) {
+            uint d = (uint)(keys[base + j] >> shift) & 0xFFu;
+            atomic_fetch_add_explicit(&counts[d], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    hist[tid * num_blocks + block] = atomic_load_explicit(&counts[tid], memory_order_relaxed);
+}
+
+// Stable scatter for one digit. The block is first sorted locally by the digit with
+// eight stable 1-bit splits in threadgroup memory; an element's rank among same-digit
+// elements of its block is then its local position minus the digit's local start.
+// Padding slots (past n) hold all-ones keys: they sort to the end of the block, so
+// valid elements are exactly local positions < n_valid.
+kernel void radix_scatter_kernel(
+    device const ulong* keys_in         [[buffer(0)]],
+    device const uint* vals_in          [[buffer(1)]],
+    device ulong* keys_out              [[buffer(2)]],
+    device uint* vals_out               [[buffer(3)]],
+    device const uint* offsets          [[buffer(4)]],  // exclusive scan of radix_count's hist
+    constant uint& n                    [[buffer(5)]],
+    constant uint& shift                [[buffer(6)]],
+    constant uint& num_blocks           [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    threadgroup ulong sk[2][RS_BLOCK];
+    threadgroup uint sv[2][RS_BLOCK];
+    threadgroup uint sg_sums[32];
+    threadgroup uint digit_start[256];
+    threadgroup atomic_uint digit_count[256];
+
+    uint base = block * RS_BLOCK;
+    uint n_valid = min((uint)RS_BLOCK, n - base);
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        bool valid = p < n_valid;
+        sk[0][p] = valid ? keys_in[base + p] : ~0ul;
+        sv[0][p] = valid ? vals_in[base + p] : 0u;
+    }
+    atomic_store_explicit(&digit_count[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint cur = 0;
+    for (uint bit = 0; bit < 8; bit++) {
+        uint f[RS_EPT];
+        uint cnt = 0;
+        for (uint j = 0; j < RS_EPT; j++) {
+            f[j] = (uint)(sk[cur][tid * RS_EPT + j] >> (shift + bit)) & 1u;
+            cnt += f[j];
+        }
+        uint total_ones;
+        uint ones_before = tg_exclusive_scan(cnt, sg_sums, sg, lane, simd_width, RS_TG, total_ones);
+        uint zeros_total = RS_BLOCK - total_ones;
+        for (uint j = 0; j < RS_EPT; j++) {
+            uint p = tid * RS_EPT + j;
+            uint dst = f[j] ? (zeros_total + ones_before) : (p - ones_before);
+            sk[1 - cur][dst] = sk[cur][p];
+            sv[1 - cur][dst] = sv[cur][p];
+            ones_before += f[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cur = 1 - cur;
+    }
+
+    uint d[RS_EPT];
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        d[j] = (uint)(sk[cur][p] >> shift) & 0xFFu;
+        if (p < n_valid) atomic_fetch_add_explicit(&digit_count[d[j]], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint unused_total;
+    digit_start[tid] = tg_exclusive_scan(atomic_load_explicit(&digit_count[tid], memory_order_relaxed),
+                                         sg_sums, sg, lane, simd_width, RS_TG, unused_total);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        if (p >= n_valid) continue;
+        uint g = offsets[d[j] * num_blocks + block] + (p - digit_start[d[j]]);
+        keys_out[g] = sk[cur][p];
+        vals_out[g] = sv[cur][p];
+    }
+}
+
+// ============================================================================
+// GPU initialization: exact 3-NN scales + gaussian attributes
+// Port of the simple-knn scheme the reference 3DGS uses: points sorted by 30-bit
+// Morton code, grouped into boxes of KNN_BOX consecutive points; each point's
+// candidate set is seeded from its sorted neighbours, then every box closer than
+// the current third-best distance is scanned. Exact, not approximate.
+// ============================================================================
+
+#define KNN_BOX 1024
+#define KNN_TILE 256   // boxes staged in threadgroup memory per pass
+
+inline uint morton_expand10(uint v) {
+    v &= 0x3FFu;
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+kernel void morton_codes_kernel(
+    device const float* points          [[buffer(0)]],  // (N, 3)
+    constant uint& n                    [[buffer(1)]],
+    constant float* bounds              [[buffer(2)]],  // lo.xyz, 1 / extent.xyz
+    device ulong* keys                  [[buffer(3)]],
+    device uint* vals                   [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float3 p = read_packed_float3(points, (int)i);
+    float3 q = clamp((p - float3(bounds[0], bounds[1], bounds[2])) *
+                     float3(bounds[3], bounds[4], bounds[5]), float3(0.f), float3(1.f)) * 1023.f;
+    uint code = (morton_expand10((uint)q.x) << 2) | (morton_expand10((uint)q.y) << 1) |
+                morton_expand10((uint)q.z);
+    keys[i] = (ulong)code;
+    vals[i] = i;
+}
+
+kernel void gather_points_kernel(
+    device const float* points          [[buffer(0)]],  // (N, 3)
+    device const uint* order            [[buffer(1)]],
+    constant uint& n                    [[buffer(2)]],
+    device float* sorted_points         [[buffer(3)]],  // (N, 3)
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    write_packed_float3(sorted_points, (int)i, read_packed_float3(points, (int)order[i]));
+}
+
+// One threadgroup per box: bounds of KNN_BOX consecutive sorted points.
+kernel void knn_box_bounds_kernel(
+    device const float* sorted_points   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device float* boxes                 [[buffer(2)]],  // (num_boxes, 6): lo.xyz, hi.xyz
+    uint tid [[thread_index_in_threadgroup]],
+    uint box [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float lo_s[3][RS_TG];
+    threadgroup float hi_s[3][RS_TG];
+    float3 lo = float3(INFINITY), hi = float3(-INFINITY);
+    uint end = min(n, (box + 1) * KNN_BOX);
+    for (uint i = box * KNN_BOX + tid; i < end; i += tg_size) {
+        float3 p = read_packed_float3(sorted_points, (int)i);
+        lo = min(lo, p);
+        hi = max(hi, p);
+    }
+    lo_s[0][tid] = lo.x; lo_s[1][tid] = lo.y; lo_s[2][tid] = lo.z;
+    hi_s[0][tid] = hi.x; hi_s[1][tid] = hi.y; hi_s[2][tid] = hi.z;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 6) {
+        uint axis = tid % 3;
+        bool is_hi = tid >= 3;
+        float v = is_hi ? -INFINITY : INFINITY;
+        for (uint k = 0; k < tg_size; k++)
+            v = is_hi ? max(v, hi_s[axis][k]) : min(v, lo_s[axis][k]);
+        boxes[box * 6 + tid] = v;
+    }
+}
+
+inline void knn_insert3(float d, thread float3& best) {
+    if (d >= best.z) return;
+    if (d < best.y) {
+        best.z = best.y;
+        if (d < best.x) { best.y = best.x; best.x = d; }
+        else best.y = d;
+    } else {
+        best.z = d;
+    }
+}
+
+inline float box_dist2(float3 p, float3 lo, float3 hi) {
+    float3 d = max(max(lo - p, p - hi), float3(0.f));
+    return dot(d, d);
+}
+
+// Mean distance to the 3 nearest other points, written in the points' original order.
+kernel void knn3_mean_dist_kernel(
+    device const float* sorted_points   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device const float* boxes           [[buffer(2)]],
+    constant uint& num_boxes            [[buffer(3)]],
+    device const uint* order            [[buffer(4)]],
+    device float* mean_dist             [[buffer(5)]],  // (N,), original order
+    uint i [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float tile[KNN_TILE * 6];
+    const bool active = i < n;
+    float3 p = active ? read_packed_float3(sorted_points, (int)i) : float3(0.f);
+
+    // Seed the bound from neighbours in Morton order
+    float3 best = float3(INFINITY);
+    if (active) {
+        uint j0 = (i >= 3) ? i - 3 : 0;
+        uint j1 = min(n - 1, i + 3);
+        for (uint j = j0; j <= j1; j++) {
+            if (j == i) continue;
+            float3 d = read_packed_float3(sorted_points, (int)j) - p;
+            knn_insert3(dot(d, d), best);
+        }
+    }
+    const float reject = best.z;
+    best = float3(INFINITY);
+
+    for (uint t0 = 0; t0 < num_boxes; t0 += KNN_TILE) {
+        for (uint k = tid; k < KNN_TILE * 6; k += tg_size)
+            tile[k] = (t0 * 6 + k < num_boxes * 6) ? boxes[t0 * 6 + k] : 0.f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            uint count = min((uint)KNN_TILE, num_boxes - t0);
+            for (uint k = 0; k < count; k++) {
+                float3 lo = float3(tile[6 * k], tile[6 * k + 1], tile[6 * k + 2]);
+                float3 hi = float3(tile[6 * k + 3], tile[6 * k + 4], tile[6 * k + 5]);
+                float bd = box_dist2(p, lo, hi);
+                if (bd > reject || bd > best.z) continue;
+                uint s = (t0 + k) * KNN_BOX;
+                uint e = min(n, s + KNN_BOX);
+                for (uint j = s; j < e; j++) {
+                    if (j == i) continue;
+                    float3 d = read_packed_float3(sorted_points, (int)j) - p;
+                    knn_insert3(dot(d, d), best);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active) {
+        float sum = 0.f, cnt = 0.f;
+        if (isfinite(best.x)) { sum += sqrt(best.x); cnt += 1.f; }
+        if (isfinite(best.y)) { sum += sqrt(best.y); cnt += 1.f; }
+        if (isfinite(best.z)) { sum += sqrt(best.z); cnt += 1.f; }
+        mean_dist[order[i]] = cnt > 0.f ? sum / cnt : 1.f;
+    }
+}
+
+// Gaussian attributes from points: isotropic log-scale from the 3-NN distance,
+// uniformly random rotation (Shoemake), DC SH from the point color, constant opacity.
+kernel void init_gaussians_kernel(
+    device const float* mean_dist       [[buffer(0)]],  // (N,)
+    device const uchar* rgb             [[buffer(1)]],  // (N, 3)
+    constant uint& n                    [[buffer(2)]],
+    constant uint& seed                 [[buffer(3)]],
+    constant float& opacity_logit       [[buffer(4)]],
+    device float* scales                [[buffer(5)]],  // (N, 3) log-space
+    device float* quats                 [[buffer(6)]],  // (N, 4)
+    device float* features_dc           [[buffer(7)]],  // (N, 3)
+    device float* opacities             [[buffer(8)]],  // (N, 1)
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    // Coincident points would give log(0); clamp like the reference implementation.
+    float s = log(max(mean_dist[i], 1e-7f));
+    scales[3 * i] = s; scales[3 * i + 1] = s; scales[3 * i + 2] = s;
+
+    float u = rand_uniform(seed, 3u * i), v = rand_uniform(seed, 3u * i + 1u), w = rand_uniform(seed, 3u * i + 2u);
+    quats[4 * i + 0] = sqrt(1.f - u) * sin(2.f * M_PI_F * v);
+    quats[4 * i + 1] = sqrt(1.f - u) * cos(2.f * M_PI_F * v);
+    quats[4 * i + 2] = sqrt(u) * sin(2.f * M_PI_F * w);
+    quats[4 * i + 3] = sqrt(u) * cos(2.f * M_PI_F * w);
+
+    for (uint c = 0; c < 3; c++)
+        features_dc[3 * i + c] = ((float)rgb[3 * i + c] * (1.f / 255.f) - 0.5f) / SH_C0;
+    opacities[i] = opacity_logit;
+}
+
+// ============================================================================
+// Image pipeline (GPU-resident datasets)
+// Images are decoded straight into GPU-visible RGBA8 memory; conversion,
+// resampling and undistortion happen here and only float GPU levels are kept.
+// ============================================================================
+
+// Area (box) resample into float RGB: each output pixel averages the source area it
+// covers, weighted by overlap, for any (also non-integer) scale; equal sizes copy. The
+// source is RGBA8 when src_is_u8, float RGB otherwise; the unused one is a dummy.
+kernel void image_resize_area_kernel(
+    device const uchar* src_u8          [[buffer(0)]],  // (sh, sw, 4)
+    device const float* src_f           [[buffer(1)]],  // (sh, sw, 3)
+    constant uint* dims                 [[buffer(2)]],  // sw, sh, dw, dh
+    constant uint& src_is_u8            [[buffer(3)]],
+    device float* dst                   [[buffer(4)]],  // (dh, dw, 3)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint sw = dims[0], sh = dims[1], dw = dims[2], dh = dims[3];
+    if (gid.x >= dw || gid.y >= dh) return;
+    const float scale_x = (float)sw / (float)dw, scale_y = (float)sh / (float)dh;
+    const float sy0 = (float)gid.y * scale_y, sy1 = (float)(gid.y + 1) * scale_y;
+    const float sx0 = (float)gid.x * scale_x, sx1 = (float)(gid.x + 1) * scale_x;
+    const int iy0 = (int)sy0, iy1 = min((int)ceil(sy1), (int)sh);
+    const int ix0 = (int)sx0, ix1 = min((int)ceil(sx1), (int)sw);
+    float3 sum = float3(0.f);
+    float area = 0.f;
+    for (int iy = iy0; iy < iy1; iy++) {
+        float wy = min((float)(iy + 1), sy1) - max((float)iy, sy0);
+        for (int ix = ix0; ix < ix1; ix++) {
+            float wx = min((float)(ix + 1), sx1) - max((float)ix, sx0);
+            uint s = (uint)iy * sw + (uint)ix;
+            float3 c = src_is_u8
+                ? float3((float)src_u8[4 * s], (float)src_u8[4 * s + 1], (float)src_u8[4 * s + 2]) * (1.f / 255.f)
+                : read_packed_float3(src_f, (int)s);
+            sum += (wx * wy) * c;
+            area += wx * wy;
+        }
+    }
+    write_packed_float3(dst, (int)(gid.y * dw + gid.x), sum / area);
+}
+
+// Must match UndistortParamsGPU in msplat_metal.mm.
+struct UndistortParams {
+    float fx, fy, cx, cy;
+    float k1, k2, p1, p2, k3;
+    uint src_w, src_h, dst_w, dst_h, roi_x, roi_y, pad;
+};
+
+// Brown-Conrady undistortion of the crop [roi, roi + dst) of the undistorted image
+// (same focal lengths): forward-distort each output pixel's center and bilinearly
+// sample the source, clamped to its border. The principal point is in pixel-edge
+// coordinates like everywhere else (pixel j's center at j + 0.5). The crop comes from
+// undistortROI on the host.
+kernel void image_undistort_kernel(
+    device const float* src             [[buffer(0)]],  // (src_h, src_w, 3)
+    constant UndistortParams& p         [[buffer(1)]],
+    device float* dst                   [[buffer(2)]],  // (dst_h, dst_w, 3)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (gid.x >= p.dst_w || gid.y >= p.dst_h) return;
+    float x = ((float)(gid.x + p.roi_x) + 0.5f - p.cx) / p.fx;
+    float y = ((float)(gid.y + p.roi_y) + 0.5f - p.cy) / p.fy;
+    float r2 = x * x + y * y;
+    float radial = 1.f + p.k1 * r2 + p.k2 * r2 * r2 + p.k3 * r2 * r2 * r2;
+    float xd = x * radial + 2.f * p.p1 * x * y + p.p2 * (r2 + 2.f * x * x);
+    float yd = y * radial + p.p1 * (r2 + 2.f * y * y) + 2.f * p.p2 * x * y;
+    // source position in pixel-center coordinates, as the bilinear taps index it
+    float sx = xd * p.fx + p.cx - 0.5f, sy = yd * p.fy + p.cy - 0.5f;
+
+    int x0 = (int)floor(sx), y0 = (int)floor(sy);
+    float fx = sx - floor(sx), fy = sy - floor(sy);
+    int xa = clamp(x0, 0, (int)p.src_w - 1), xb = clamp(x0 + 1, 0, (int)p.src_w - 1);
+    int ya = clamp(y0, 0, (int)p.src_h - 1), yb = clamp(y0 + 1, 0, (int)p.src_h - 1);
+    float3 c00 = read_packed_float3(src, ya * (int)p.src_w + xa), c10 = read_packed_float3(src, ya * (int)p.src_w + xb);
+    float3 c01 = read_packed_float3(src, yb * (int)p.src_w + xa), c11 = read_packed_float3(src, yb * (int)p.src_w + xb);
+    float3 top = c00 * (1.f - fx) + c10 * fx;
+    float3 bottom = c01 * (1.f - fx) + c11 * fx;
+    write_packed_float3(dst, (int)(gid.y * p.dst_w + gid.x), top * (1.f - fy) + bottom * fy);
+}
+
+// ── Evaluation metrics ──
+// Evaluation SSIM, same definition as the former CPU evaluator (11-tap Gaussian,
+// sigma 1.5, clamp-to-edge borders) so reported numbers stay comparable across
+// versions; the training SSIM kernels zero-pad instead.
+
+kernel void eval_ssim_h_kernel(
+    device const float* a               [[buffer(0)]],  // (H, W, 3) render
+    device const float* b               [[buffer(1)]],  // (H, W, 3) ground truth
+    constant uint2& size                [[buffer(2)]],  // (W, H)
+    device float* hbuf                  [[buffer(3)]],  // (H, W, 15)
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint W = size.x, H = size.y;
+    if (gid.x >= W || gid.y >= H) return;
+    for (uint c = 0; c < 3; c++) {
+        float s[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+        for (int k = 0; k < SSIM_WIN; k++) {
+            int sx = clamp((int)gid.x + k - SSIM_HALF_WIN, 0, (int)W - 1);
+            uint i = (gid.y * W + (uint)sx) * 3 + c;
+            float w = GAUSS_1D[k], x = a[i], y = b[i];
+            s[0] += w * x; s[1] += w * y; s[2] += w * x * x; s[3] += w * y * y; s[4] += w * x * y;
+        }
+        uint o = (gid.y * W + gid.x) * 15 + c * 5;
+        for (uint f = 0; f < 5; f++) hbuf[o + f] = s[f];
+    }
+}
+
+// Vertical pass + per-pixel SSIM, absolute and squared error, reduced to one partial
+// sum triple per threadgroup (summed in double precision on the host).
+kernel void eval_ssim_v_kernel(
+    device const float* a               [[buffer(0)]],
+    device const float* b               [[buffer(1)]],
+    device const float* hbuf            [[buffer(2)]],
+    constant uint2& size                [[buffer(3)]],
+    device float* partials              [[buffer(4)]],  // (num_threadgroups, 3): ssim, l1, sq
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint2 tg_count [[threadgroups_per_grid]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint2 tg_size [[threads_per_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    const uint W = size.x, H = size.y;
+    float ssim = 0.f, l1 = 0.f, sq = 0.f;
+    if (gid.x < W && gid.y < H) {
+        for (uint c = 0; c < 3; c++) {
+            float s[5] = {0.f, 0.f, 0.f, 0.f, 0.f};
+            for (int k = 0; k < SSIM_WIN; k++) {
+                int sy = clamp((int)gid.y + k - SSIM_HALF_WIN, 0, (int)H - 1);
+                uint o = ((uint)sy * W + gid.x) * 15 + c * 5;
+                float w = GAUSS_1D[k];
+                for (uint f = 0; f < 5; f++) s[f] += w * hbuf[o + f];
+            }
+            float m12 = s[0] * s[1], m1sq = s[0] * s[0], m2sq = s[1] * s[1];
+            float num = (2.f * m12 + SSIM_C1) * (2.f * (s[4] - m12) + SSIM_C2);
+            float den = (m1sq + m2sq + SSIM_C1) * ((s[2] - m1sq) + (s[3] - m2sq) + SSIM_C2);
+            ssim += num / den;
+            uint i = (gid.y * W + gid.x) * 3 + c;
+            float d = a[i] - b[i];
+            l1 += fabs(d);
+            sq += d * d;
+        }
+    }
+    threadgroup float part[3][32];
+    ssim = simd_sum(ssim); l1 = simd_sum(l1); sq = simd_sum(sq);
+    if (lane == 0) { part[0][sg] = ssim; part[1][sg] = l1; part[2][sg] = sq; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tr == 0) {
+        uint n_sg = (tg_size.x * tg_size.y + simd_width - 1) / simd_width;
+        float t0 = 0.f, t1 = 0.f, t2 = 0.f;
+        for (uint k = 0; k < n_sg; k++) { t0 += part[0][k]; t1 += part[1][k]; t2 += part[2][k]; }
+        uint g = tgid.y * tg_count.x + tgid.x;
+        partials[3 * g] = t0; partials[3 * g + 1] = t1; partials[3 * g + 2] = t2;
+    }
+}
+
+// Display packing: float RGB → RGBA8 (clamped, truncated), one 32-bit store per
+// pixel; little-endian, so bytes land as R, G, B, A.
+kernel void pack_rgba8_kernel(
+    device const float* img             [[buffer(0)]],  // (n, 3)
+    constant uint& n                    [[buffer(1)]],
+    device uint* out                    [[buffer(2)]],  // (n,) RGBA8
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float3 c = saturate(read_packed_float3(img, (int)i)) * 255.f;
+    out[i] = (uint)c.x | ((uint)c.y << 8) | ((uint)c.z << 16) | (255u << 24);
+}
+
+// Expected depth (dataset units) and accumulated alpha from the aux render outputs.
+kernel void depth_finalize_kernel(
+    device const float* depth_num       [[buffer(0)]],  // sum_i w_i z_i
+    device const float* final_T         [[buffer(1)]],
+    constant uint& n                    [[buffer(2)]],
+    constant float& inv_scale           [[buffer(3)]],  // normalized scene → dataset units
+    device float* depth_out             [[buffer(4)]],
+    device float* alpha_out             [[buffer(5)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float a = 1.f - final_T[i];
+    alpha_out[i] = a;
+    depth_out[i] = a > 1e-4f ? depth_num[i] / a * inv_scale : 0.f;
 }

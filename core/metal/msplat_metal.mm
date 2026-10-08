@@ -158,6 +158,34 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // Prior-guided training
+    id<MTLComputePipelineState> rasterize_forward_aux_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_backward_aux_kernel_cpso;
+    id<MTLComputePipelineState> prior_loss_kernel_cpso;
+    id<MTLComputePipelineState> sky_backward_kernel_cpso;
+    id<MTLComputePipelineState> exposure_apply_kernel_cpso;
+    id<MTLComputePipelineState> exposure_backward_kernel_cpso;
+    id<MTLComputePipelineState> exposure_adam_kernel_cpso;
+    id<MTLComputePipelineState> scale_ratio_cap_kernel_cpso;
+    // GPU-resident training utilities
+    id<MTLComputePipelineState> opacity_reset_kernel_cpso;
+    // Scan / radix sort / GPU initialization
+    id<MTLComputePipelineState> scan_block_kernel_cpso;
+    id<MTLComputePipelineState> scan_add_kernel_cpso;
+    id<MTLComputePipelineState> radix_count_kernel_cpso;
+    id<MTLComputePipelineState> radix_scatter_kernel_cpso;
+    id<MTLComputePipelineState> morton_codes_kernel_cpso;
+    id<MTLComputePipelineState> gather_points_kernel_cpso;
+    id<MTLComputePipelineState> knn_box_bounds_kernel_cpso;
+    id<MTLComputePipelineState> knn3_mean_dist_kernel_cpso;
+    id<MTLComputePipelineState> init_gaussians_kernel_cpso;
+    // Image pipeline, metrics, display
+    id<MTLComputePipelineState> image_resize_area_kernel_cpso;
+    id<MTLComputePipelineState> image_undistort_kernel_cpso;
+    id<MTLComputePipelineState> eval_ssim_h_kernel_cpso;
+    id<MTLComputePipelineState> eval_ssim_v_kernel_cpso;
+    id<MTLComputePipelineState> pack_rgba8_kernel_cpso;
+    id<MTLComputePipelineState> depth_finalize_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -261,6 +289,34 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    // Prior-guided training
+    ctx->rasterize_forward_aux_kernel_cpso        = load(@"rasterize_forward_aux_kernel");
+    ctx->rasterize_backward_aux_kernel_cpso       = load(@"rasterize_backward_aux_kernel");
+    ctx->prior_loss_kernel_cpso                   = load(@"prior_loss_kernel");
+    ctx->sky_backward_kernel_cpso                 = load(@"sky_backward_kernel");
+    ctx->exposure_apply_kernel_cpso               = load(@"exposure_apply_kernel");
+    ctx->exposure_backward_kernel_cpso            = load(@"exposure_backward_kernel");
+    ctx->exposure_adam_kernel_cpso                = load(@"exposure_adam_kernel");
+    ctx->scale_ratio_cap_kernel_cpso              = load(@"scale_ratio_cap_kernel");
+    // GPU-resident training utilities
+    ctx->opacity_reset_kernel_cpso                = load(@"opacity_reset_kernel");
+    // Scan / radix sort / GPU initialization
+    ctx->scan_block_kernel_cpso                   = load(@"scan_block_kernel");
+    ctx->scan_add_kernel_cpso                     = load(@"scan_add_kernel");
+    ctx->radix_count_kernel_cpso                  = load(@"radix_count_kernel");
+    ctx->radix_scatter_kernel_cpso                = load(@"radix_scatter_kernel");
+    ctx->morton_codes_kernel_cpso                 = load(@"morton_codes_kernel");
+    ctx->gather_points_kernel_cpso                = load(@"gather_points_kernel");
+    ctx->knn_box_bounds_kernel_cpso               = load(@"knn_box_bounds_kernel");
+    ctx->knn3_mean_dist_kernel_cpso               = load(@"knn3_mean_dist_kernel");
+    ctx->init_gaussians_kernel_cpso               = load(@"init_gaussians_kernel");
+    // Image pipeline, metrics, display
+    ctx->image_resize_area_kernel_cpso            = load(@"image_resize_area_kernel");
+    ctx->image_undistort_kernel_cpso              = load(@"image_undistort_kernel");
+    ctx->eval_ssim_h_kernel_cpso                  = load(@"eval_ssim_h_kernel");
+    ctx->eval_ssim_v_kernel_cpso                  = load(@"eval_ssim_v_kernel");
+    ctx->pack_rgba8_kernel_cpso                   = load(@"pack_rgba8_kernel");
+    ctx->depth_finalize_kernel_cpso               = load(@"depth_finalize_kernel");
 
     [metal_library release];
 
@@ -458,7 +514,7 @@ struct FusedTensorCache {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
         if (!overflow_flag.defined()) {
-            overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+            overflow_flag = mtensor_zeros(dev, {1}, DType::Int32);  // sticky, never cleared
         }
     }
 
@@ -489,8 +545,82 @@ struct FusedTensorCache {
             v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
         }
     }
+
+    // Prior-guided training buffers, allocated on first use
+    int aux_h = 0, aux_w = 0;
+    MTensor out_depth, bg_img, v_aux;   // (H, W) sum w_i z_i, (H, W, 3) background, (H, W, 2) dL/dD, dL/dA
+    int expo_h = 0, expo_w = 0;
+    MTensor out_adj, v_adj;             // (H, W, 3) exposure-transformed render and its cotangent
+    // Bound in place of absent optional inputs: Metal needs a valid buffer at every
+    // index a kernel declares, even one it never reads.
+    MTensor dummy_tex, dummy_depth, dummy_aux, dummy_terms;
+
+    // Display packing and evaluation scratch, reused across calls
+    MTensor rgba8_out, eval_hbuf, eval_partials;
+
+    void ensure_aux(int ih, int iw, id<MTLDevice> dev) {
+        if (ih == aux_h && iw == aux_w && out_depth.defined()) return;
+        aux_h = ih; aux_w = iw;
+        out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+        bg_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        v_aux = mtensor_zeros(dev, {ih, iw, 2}, DType::Float32);
+    }
+
+    void ensure_exposure(int ih, int iw, id<MTLDevice> dev) {
+        if (ih == expo_h && iw == expo_w && out_adj.defined()) return;
+        expo_h = ih; expo_w = iw;
+        out_adj = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        v_adj = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+    }
+
+    void ensure_dummies(id<MTLDevice> dev) {
+        if (dummy_tex.defined()) return;
+        dummy_tex = mtensor_zeros(dev, {1, 1, 3}, DType::Float32);
+        dummy_depth = mtensor_zeros(dev, {1, 1}, DType::Float32);
+        dummy_aux = mtensor_zeros(dev, {1, 1, 4}, DType::UInt8);
+        dummy_aux.data<uint8_t>()[2] = 255;  // keep everything, no sky, zero confidence
+        dummy_terms = mtensor_zeros(dev, {4}, DType::Float32);
+    }
 };
 static FusedTensorCache g_tcache;
+
+// Must match SkyParams in msplat_metal.metal.
+struct PriorSkyParams {
+    float up[3], e1[3], e2[3];
+    float fx, fy, cx, cy;
+    uint32_t tex_w, tex_h, enabled, pad;
+};
+static_assert(sizeof(PriorSkyParams) == 68, "PriorSkyParams must match SkyParams");
+
+// Must match PriorLossParams in msplat_metal.metal.
+struct PriorLossParamsGPU {
+    uint32_t img_w, img_h, prior_w, prior_h;
+    float depth_weight, sky_weight, fill_weight, huber_delta, min_alpha, inv_npix;
+    uint32_t has_depth, has_sky_mask, mask_photo, pad0, pad1, pad2;
+};
+static_assert(sizeof(PriorLossParamsGPU) == 64, "PriorLossParamsGPU must match PriorLossParams");
+
+static PriorSkyParams make_sky_params(const PriorStep *prior, float fx, float fy, float cx, float cy) {
+    PriorSkyParams sp = {};
+    sp.fx = fx; sp.fy = fy; sp.cx = cx; sp.cy = cy;
+    if (prior && prior->sky && prior->sky_tex) {
+        memcpy(sp.up, prior->sky_frame, 3 * sizeof(float));
+        memcpy(sp.e1, prior->sky_frame + 3, 3 * sizeof(float));
+        memcpy(sp.e2, prior->sky_frame + 6, 3 * sizeof(float));
+        sp.tex_w = (uint32_t)prior->sky_w;
+        sp.tex_h = (uint32_t)prior->sky_h;
+        sp.enabled = 1;
+    } else {
+        sp.tex_w = 1;
+        sp.tex_h = 1;
+    }
+    return sp;
+}
+
+void msplat_render_aux_outputs(MTensor &depth, MTensor &final_T) {
+    depth = g_tcache.out_depth;
+    final_T = g_tcache.final_Ts;
+}
 
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
@@ -508,28 +638,25 @@ static void forward_pipeline(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    bool compute_loss,
+    const PriorStep *prior
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
+    const bool aux = prior && prior->aux;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians).
+    // The flag is sticky (never cleared), so peeking at it in shared memory without a
+    // sync only delays the warning until the GPU has written it — no pipeline drain.
     static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
+    if (!overflow_warned && g_tcache.overflow_flag.defined()
+        && *g_tcache.overflow_flag.data<int32_t>() > 0) {
+        fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                "Some gaussians were dropped from overfull tiles.\n");
+        overflow_warned = true;
     }
     // scatter_to_prealloc_bins clamps every tile counter to MAX_TILE_ELEMS, so the
     // prefix sum over them cannot exceed num_tiles * MAX_TILE_ELEMS. This is the only
@@ -708,6 +835,29 @@ static void forward_pipeline(
         }
     };
 
+    // Depth + per-pixel background variant (prior-guided rendering, learned sky)
+    PriorSkyParams sky_params = make_sky_params(prior, fx, fy, cx, cy);
+    if (aux) {
+        g_tcache.ensure_aux(img_height, img_width, ctx->device);
+        g_tcache.ensure_dummies(ctx->device);
+    }
+    auto encode_rast_fwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTensor &sky_tex = (prior->sky && prior->sky_tex) ? *prior->sky_tex : g_tcache.dummy_tex;
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_forward_aux_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2);
+        ENC_BUF(enc, packed_xy_opac, 3); ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, packed_rgb, 5);
+        ENC_BUF(enc, gaussian_ids, 6); ENC_BUF(enc, depths, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11); ENC_BUF(enc, g_tcache.bg_img, 12);
+        ENC_BUF(enc, background, 13); ENC_BUF(enc, sky_tex, 14);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:15];
+        ENC_BUF(enc, viewmat, 16);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+    };
+
     auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
@@ -738,8 +888,9 @@ static void forward_pipeline(
     // Compute K_max conservatively from CPU-side data (no GPU sync needed).
     // avg_per_tile = capacity / num_tiles. Use 6x average to cover heavy-tailed
     // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
-    if (num_tiles >= 400) {
-        // High-res: enough tiles for good GPU occupancy, skip chunking
+    if (num_tiles >= 400 || aux) {
+        // High-res: enough tiles for good GPU occupancy, skip chunking.
+        // The aux rasterizer only has a monolithic variant.
         K_max = 1;
     } else {
         uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
@@ -765,7 +916,6 @@ static void forward_pipeline(
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
             // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-            [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
 
@@ -776,7 +926,8 @@ static void forward_pipeline(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_prefix_map(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(encoder);
+            if (aux) encode_rast_fwd_aux(encoder);
+            else encode_rast_fwd(encoder);
             if (compute_loss) {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode_loss_fwd(encoder);
@@ -797,14 +948,15 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    const PriorStep *prior
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background, dummyGt, dummyWindow, 0.0f, false, prior);
     return g_tcache.out_img;
 }
 
@@ -824,28 +976,28 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    const PriorStep *prior
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
+    const bool aux = prior && prior->aux;
+    const bool sky = aux && prior->sky && prior->sky_tex && prior->sky_grad;
+    const bool exposure = prior && prior->exposure && prior->expo_params;
+    const bool scale_cap = prior && prior->log_max_scale_ratio > 0.f;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians).
+    // The flag is sticky (never cleared), so peeking at it in shared memory without a
+    // sync only delays the warning until the GPU has written it — no pipeline drain.
     static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
+    if (!overflow_warned && g_tcache.overflow_flag.defined()
+        && *g_tcache.overflow_flag.data<int32_t>() > 0) {
+        fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                "Some gaussians were dropped from overfull tiles.\n");
+        overflow_warned = true;
     }
     // scatter_to_prealloc_bins clamps every tile counter to MAX_TILE_ELEMS, so the
     // prefix sum over them cannot exceed num_tiles * MAX_TILE_ELEMS. This is the only
@@ -913,6 +1065,15 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &v_features_dc = g_tcache.v_features_dc;
     MTensor &v_features_rest = g_tcache.v_features_rest;
 
+    // Prior-guided extras. With exposure on, the photometric loss sees the transformed
+    // render (out_adj) and writes its cotangent to v_adj; exposure_backward maps that
+    // back to v_rendered.
+    if (aux) g_tcache.ensure_aux(img_height, img_width, ctx->device);
+    if (exposure) g_tcache.ensure_exposure(img_height, img_width, ctx->device);
+    if (prior) g_tcache.ensure_dummies(ctx->device);
+    MTensor &loss_in = exposure ? g_tcache.out_adj : out_img;
+    MTensor &loss_grad = exposure ? g_tcache.v_adj : v_rendered;
+
     // Wire backward outputs as Adam grads (MTensor references for gradient buffers)
     auto adam_grads = std::make_shared<std::array<MTensor, 6>>(
         std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest, v_opacity});
@@ -940,7 +1101,8 @@ std::tuple<MTensor, float> msplat_train_step(
     // --- K_max for chunked rasterization ---
     uint32_t K_max = 1;
     constexpr uint32_t CHUNK_SIZE = 512;
-    if (num_tiles >= 400) {
+    if (num_tiles >= 400 || aux) {
+        // The aux rasterizers only have a monolithic variant.
         K_max = 1;
     } else {
         uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
@@ -1062,19 +1224,20 @@ std::tuple<MTensor, float> msplat_train_step(
 
     // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
     // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+    // loss_in / loss_grad are out_img / v_rendered unless exposure compensation is on.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
@@ -1083,12 +1246,146 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, loss_intermediates, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, v_rendered, 6);
+        ENC_BUF(enc, loss_grad, 6);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+    };
+
+    // ======================= PRIOR-GUIDED ENCODE LAMBDAS =======================
+    // Only reached when the matching flag (aux / sky / exposure / scale_cap) is set,
+    // and therefore only with a non-null prior.
+
+    PriorSkyParams sky_params = make_sky_params(sky ? prior : nullptr, fx, fy, cx, cy);
+    uint32_t num_pix_u32 = img_width * img_height;
+    uint32_t expo_cam = prior ? (uint32_t)std::max(0, prior->cam_index) : 0u;
+
+    auto encode_rast_fwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTensor &sky_tex = sky ? *prior->sky_tex : g_tcache.dummy_tex;
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_forward_aux_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2);
+        ENC_BUF(enc, packed_xy_opac, 3); ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, packed_rgb, 5);
+        ENC_BUF(enc, gaussian_ids, 6); ENC_BUF(enc, depths, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11); ENC_BUF(enc, g_tcache.bg_img, 12);
+        ENC_BUF(enc, background, 13); ENC_BUF(enc, sky_tex, 14);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:15];
+        ENC_BUF(enc, viewmat, 16);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+    };
+
+    auto encode_exposure_apply = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->exposure_apply_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->exposure_apply_kernel_cpso];
+        ENC_BUF(enc, out_img, 0);
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:1];
+        ENC_SCALAR(enc, expo_cam, 2); ENC_SCALAR(enc, num_pix_u32, 3);
+        ENC_BUF(enc, g_tcache.out_adj, 4);
+        [enc dispatchThreads:MTLSizeMake(num_pix_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    // Writes v_aux for every pixel (zeros where no prior applies) and masks loss_grad.
+    auto encode_prior_loss = [&](id<MTLComputeCommandEncoder> enc) {
+        const bool has_prior = prior->prior_depth && prior->prior_aux && prior->prior_w > 0 && prior->prior_h > 0;
+        MTensor &prior_depth = has_prior ? *prior->prior_depth : g_tcache.dummy_depth;
+        MTensor &prior_aux = has_prior ? *prior->prior_aux : g_tcache.dummy_aux;
+        MTensor &loss_terms = prior->loss_terms ? *prior->loss_terms : g_tcache.dummy_terms;
+        PriorLossParamsGPU lp = {};
+        lp.img_w = img_width; lp.img_h = img_height;
+        lp.prior_w = has_prior ? (uint32_t)prior->prior_w : 1u;
+        lp.prior_h = has_prior ? (uint32_t)prior->prior_h : 1u;
+        lp.depth_weight = prior->depth_weight;
+        lp.sky_weight = prior->sky_weight;
+        lp.fill_weight = prior->fill_weight;
+        lp.huber_delta = std::max(prior->huber_delta, 1e-6f);
+        lp.min_alpha = prior->min_alpha;
+        lp.inv_npix = 1.0f / (float)(img_width * img_height);
+        lp.has_depth = (has_prior && prior->has_depth) ? 1u : 0u;
+        lp.has_sky_mask = (has_prior && prior->has_sky_mask) ? 1u : 0u;
+        lp.mask_photo = prior->mask_photometric ? 1u : 0u;
+        [enc setComputePipelineState:ctx->prior_loss_kernel_cpso];
+        ENC_BUF(enc, g_tcache.out_depth, 0); ENC_BUF(enc, final_Ts, 1);
+        ENC_BUF(enc, prior_depth, 2); ENC_BUF(enc, prior_aux, 3);
+        [enc setBytes:&lp length:sizeof(lp) atIndex:4];
+        ENC_BUF(enc, g_tcache.v_aux, 5); ENC_BUF(enc, loss_grad, 6); ENC_BUF(enc, loss_terms, 7);
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    };
+
+    // v_adj → v_rendered, then one Adam step on this camera's 12 exposure parameters.
+    auto encode_exposure_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->exposure_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->exposure_backward_kernel_cpso];
+        ENC_BUF(enc, out_img, 0);
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:1];
+        ENC_SCALAR(enc, expo_cam, 2); ENC_SCALAR(enc, num_pix_u32, 3);
+        ENC_BUF(enc, g_tcache.v_adj, 4); ENC_BUF(enc, v_rendered, 5);
+        [enc setBuffer:prior->expo_grad->buffer() offset:0 atIndex:6];
+        [enc dispatchThreads:MTLSizeMake(num_pix_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->exposure_adam_kernel_cpso];
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:0];
+        [enc setBuffer:prior->expo_exp_avg->buffer() offset:0 atIndex:1];
+        [enc setBuffer:prior->expo_exp_avg_sq->buffer() offset:0 atIndex:2];
+        [enc setBuffer:prior->expo_grad->buffer() offset:0 atIndex:3];
+        ENC_SCALAR(enc, expo_cam, 4);
+        ENC_SCALAR(enc, prior->expo_step_size, 5); ENC_SCALAR(enc, prior->expo_bc2_sqrt, 6);
+        ENC_SCALAR(enc, prior->expo_reg, 7);
+        ENC_SCALAR(enc, adam_beta1, 8); ENC_SCALAR(enc, adam_beta2, 9); ENC_SCALAR(enc, adam_eps, 10);
+        [enc dispatchThreads:MTLSizeMake(12, 1, 1) threadsPerThreadgroup:MTLSizeMake(12, 1, 1)];
+    };
+
+    // Sky texture gradient from the transparent pixels, then one Adam step on the texture.
+    auto encode_sky_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:ctx->sky_backward_kernel_cpso];
+        ENC_BUF(enc, v_rendered, 0); ENC_BUF(enc, final_Ts, 1); ENC_BUF(enc, viewmat, 2);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:3];
+        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:4];
+        [enc setBuffer:prior->sky_grad->buffer() offset:0 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        uint32_t n = (uint32_t)prior->sky_tex->numel();
+        NSUInteger tpg = MIN(ctx->fused_adam_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        [enc setComputePipelineState:ctx->fused_adam_kernel_cpso];
+        [enc setBuffer:prior->sky_tex->buffer() offset:0 atIndex:0];
+        [enc setBuffer:prior->sky_grad->buffer() offset:0 atIndex:1];
+        [enc setBuffer:prior->sky_exp_avg->buffer() offset:0 atIndex:2];
+        [enc setBuffer:prior->sky_exp_avg_sq->buffer() offset:0 atIndex:3];
+        ENC_SCALAR(enc, prior->sky_step_size, 4);
+        ENC_SCALAR(enc, adam_beta1, 5); ENC_SCALAR(enc, adam_beta2, 6);
+        ENC_SCALAR(enc, prior->sky_bc2_sqrt, 7); ENC_SCALAR(enc, adam_eps, 8);
+        ENC_SCALAR(enc, n, 9);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    // Post-loss prior stages, in dependency order: prior loss (masks loss_grad) →
+    // exposure backward (loss_grad → v_rendered) → sky backward (reads v_rendered).
+    auto encode_prior_post_loss = [&](id<MTLComputeCommandEncoder> enc) {
+        if (aux) {
+            encode_prior_loss(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        if (exposure) {
+            encode_exposure_bwd_adam(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        if (sky) {
+            encode_sky_bwd_adam(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+    };
+
+    auto encode_scale_cap = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->scale_ratio_cap_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->scale_ratio_cap_kernel_cpso];
+        ENC_BUF(enc, scales, 0);
+        ENC_SCALAR(enc, num_points_u32, 1);
+        ENC_SCALAR(enc, prior->log_max_scale_ratio, 2);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1138,6 +1435,22 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
+    };
+
+    auto encode_rast_bwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize num_tg = MTLSizeMake((img_width+RAST_BLOCK_X-1)/RAST_BLOCK_X, (img_height+RAST_BLOCK_Y-1)/RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_backward_aux_kernel_cpso];
+        [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
+        [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
+        ENC_BUF(enc, gaussian_ids, 2); ENC_BUF(enc, tile_bins, 3);
+        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+        ENC_BUF(enc, depths, 7); ENC_BUF(enc, g_tcache.bg_img, 8);
+        ENC_BUF(enc, final_Ts, 9); ENC_BUF(enc, final_idx, 10);
+        ENC_BUF(enc, v_rendered, 11); ENC_BUF(enc, g_tcache.v_aux, 12);
+        ENC_BUF(enc, v_xy, 13); ENC_BUF(enc, v_conic, 14);
+        ENC_BUF(enc, v_colors_rast, 15); ENC_BUF(enc, v_opacity, 16);
+        ENC_BUF(enc, v_depth, 17);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
     };
 
     // Packed SH Adam hyperparameters (must match SHAdamParams in .metal)
@@ -1225,7 +1538,6 @@ std::tuple<MTensor, float> msplat_train_step(
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-        [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
@@ -1234,6 +1546,13 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
+        // Only the aux backward writes v_depth, but project_and_sh_backward always reads it,
+        // so it is cleared every step (g_tcache is shared by every trainer in the process).
+        [blit fillBuffer:v_depth.buffer() range:NSMakeRange(0, v_depth.nbytes()) value:0];
+        if (aux && prior->loss_terms)
+            [blit fillBuffer:prior->loss_terms->buffer() range:NSMakeRange(0, prior->loss_terms->nbytes()) value:0];
+        if (sky)
+            [blit fillBuffer:prior->sky_grad->buffer() range:NSMakeRange(0, prior->sky_grad->nbytes()) value:0];
         // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
         [blit endEncoding];
     };
@@ -1293,24 +1612,38 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_prefix_map(enc);
             [enc endEncoding];
 
-            // Stage 3: rast_fwd
+            // Stage 3: rast_fwd (+ exposure transform)
             enc = make_profiled_encoder(2);
-            encode_rast_fwd(enc);
+            if (aux) encode_rast_fwd_aux(enc);
+            else encode_rast_fwd(enc);
+            if (exposure) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_exposure_apply(enc);
+            }
             [enc endEncoding];
 
-            // Stage 4+5: loss_fwd_bwd (fused)
+            // Stage 4+5: loss_fwd_bwd (fused) + prior losses, exposure and sky backward
             enc = make_profiled_encoder(3);
             encode_loss_fwd_bwd(enc);
+            if (aux || exposure) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_prior_post_loss(enc);
+            }
             [enc endEncoding];
 
             // Stage 5: rast_bwd
             enc = make_profiled_encoder(4);
-            encode_rast_bwd(enc);
+            if (aux) encode_rast_bwd_aux(enc);
+            else encode_rast_bwd(enc);
             [enc endEncoding];
 
-            // Stage 6: proj_sh_bwd + Adam
+            // Stage 6: proj_sh_bwd + Adam (+ needle cap)
             enc = make_profiled_encoder(5);
             encode_proj_sh_bwd_adam(enc);
+            if (scale_cap) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_scale_cap(enc);
+            }
             [enc endEncoding];
 
             // Stage 7: grad_stats
@@ -1373,15 +1706,27 @@ std::tuple<MTensor, float> msplat_train_step(
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_prefix_map(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(enc);
+            if (aux) encode_rast_fwd_aux(enc);
+            else encode_rast_fwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (exposure) {
+                encode_exposure_apply(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             // --- Fused loss forward + backward ---
             encode_loss_fwd_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_bwd(enc);
+            // --- Prior losses, exposure and sky backward (each ends with a barrier) ---
+            encode_prior_post_loss(enc);
+            if (aux) encode_rast_bwd_aux(enc);
+            else encode_rast_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (scale_cap) {
+                encode_scale_cap(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
 
             // --- Accumulate grad stats ---
             encode_grad_stats(enc);
@@ -1413,7 +1758,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    uint32_t seed
 ) {
     MetalContext* ctx = get_global_context();
 
@@ -1513,7 +1858,7 @@ int msplat_densify(
             ENC_SCALAR(enc, N_u32, 0);
             ENC_BUF(enc, split_flag, 1);
             ENC_BUF(enc, split_prefix, 2);
-            ENC_BUF(enc, random_samples, 3);
+            ENC_SCALAR(enc, seed, 3);
             ENC_SCALAR(enc, log_size_fac, 4);
             ENC_BUF(enc, means_buf, 5);
             ENC_BUF(enc, scales_buf, 6);
@@ -1654,4 +1999,382 @@ int msplat_densify(
     ctx->syncCB();
     int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
     return new_count;
+}
+
+// ============================================================================
+// GPU-resident training utilities
+// Both encode into the in-flight command buffer, after the work already encoded
+// for this step, so they see its results without the host waiting on the GPU.
+// ============================================================================
+
+void msplat_opacity_reset(MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+                          int num_points, float reset_logit) {
+    if (num_points <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    uint32_t n = (uint32_t)num_points;
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->opacity_reset_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        [enc setComputePipelineState:ctx->opacity_reset_kernel_cpso];
+        ENC_BUF(enc, opacities, 0); ENC_BUF(enc, exp_avg, 1); ENC_BUF(enc, exp_avg_sq, 2);
+        ENC_SCALAR(enc, n, 3); ENC_SCALAR(enc, reset_logit, 4);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes) {
+    if (bytes == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    id<MTLBuffer> s = src.buffer();
+    id<MTLBuffer> d = dst.buffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit copyFromBuffer:s sourceOffset:0 toBuffer:d destinationOffset:0 size:bytes];
+        [blit endEncoding];
+    });
+}
+
+// ============================================================================
+// Scan / stable radix sort / GPU initialization
+// ============================================================================
+
+// Must match RS_TG / RS_BLOCK / KNN_BOX in msplat_metal.metal.
+static constexpr uint32_t kScanTG = 256;
+static constexpr uint32_t kScanBlock = 1024;
+static constexpr uint32_t kKnnBox = 1024;
+
+static uint32_t div_up(uint64_t a, uint64_t b) { return (uint32_t)((a + b - 1) / b); }
+
+static void require_threads(id<MTLComputePipelineState> pso, NSUInteger threads, const char *name) {
+    if (pso.maxTotalThreadsPerThreadgroup < threads)
+        throw std::runtime_error(std::string("msplat: ") + name + " needs " + std::to_string(threads) +
+                                 " threads per threadgroup on this GPU");
+}
+
+// Partial-sum buffers for every level of a multi-level exclusive scan of n values.
+static std::vector<MTensor> scan_levels(id<MTLDevice> dev, uint32_t n) {
+    std::vector<MTensor> levels;
+    uint32_t m = n;
+    while (true) {
+        uint32_t nb = div_up(m, kScanBlock);
+        levels.push_back(mtensor_empty(dev, {(int64_t)nb}, DType::Int32));
+        if (nb <= 1) break;
+        m = nb;
+    }
+    return levels;
+}
+
+// Exclusive scan of n uint32 values in place: per-block scan, recursive scan of the
+// block sums, then add them back. Ends with no trailing barrier.
+static void encode_exclusive_scan(id<MTLComputeCommandEncoder> enc, MetalContext *ctx,
+                                  id<MTLBuffer> data, uint32_t n, std::vector<MTensor> *levels, size_t level) {
+    uint32_t nb = div_up(n, kScanBlock);
+    id<MTLBuffer> partials = (*levels)[level].buffer();
+    [enc setComputePipelineState:ctx->scan_block_kernel_cpso];
+    [enc setBuffer:data offset:0 atIndex:0];
+    [enc setBytes:&n length:sizeof(n) atIndex:1];
+    [enc setBuffer:partials offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+    if (nb <= 1) return;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    encode_exclusive_scan(enc, ctx, partials, nb, levels, level + 1);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:ctx->scan_add_kernel_cpso];
+    [enc setBuffer:data offset:0 atIndex:0];
+    [enc setBytes:&n length:sizeof(n) atIndex:1];
+    [enc setBuffer:partials offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+}
+
+void msplat_radix_sort(MTensor &keys, MTensor &vals, uint32_t n, int key_bits) {
+    if (n <= 1 || key_bits <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    require_threads(ctx->radix_count_kernel_cpso, kScanTG, "radix_count_kernel");
+    require_threads(ctx->radix_scatter_kernel_cpso, kScanTG, "radix_scatter_kernel");
+    require_threads(ctx->scan_block_kernel_cpso, kScanTG, "scan_block_kernel");
+
+    uint32_t num_blocks = div_up(n, kScanBlock);
+    uint32_t hist_n = 256 * num_blocks;
+    MTensor keys_tmp = mtensor_empty(dev, {(int64_t)n}, DType::Int64);
+    MTensor vals_tmp = mtensor_empty(dev, {(int64_t)n}, DType::Int32);
+    MTensor hist = mtensor_empty(dev, {(int64_t)hist_n}, DType::Int32);
+    std::vector<MTensor> levels = scan_levels(dev, hist_n);
+    int passes = (std::min(key_bits, 64) + 7) / 8;
+
+    // std::array: blocks cannot capture C arrays
+    std::array<id<MTLBuffer>, 2> kb = {{keys.buffer(), keys_tmp.buffer()}};
+    std::array<id<MTLBuffer>, 2> vb = {{vals.buffer(), vals_tmp.buffer()}};
+    id<MTLBuffer> hb = hist.buffer();
+    std::vector<MTensor> *lv = &levels;
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        for (int pass = 0; pass < passes; pass++) {
+            uint32_t shift = 8u * (uint32_t)pass;
+            int src = pass & 1, dst = src ^ 1;
+            [enc setComputePipelineState:ctx->radix_count_kernel_cpso];
+            [enc setBuffer:kb[src] offset:0 atIndex:0];
+            [enc setBytes:&n length:sizeof(n) atIndex:1];
+            [enc setBytes:&shift length:sizeof(shift) atIndex:2];
+            [enc setBytes:&num_blocks length:sizeof(num_blocks) atIndex:3];
+            [enc setBuffer:hb offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_exclusive_scan(enc, ctx, hb, hist_n, lv, 0);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->radix_scatter_kernel_cpso];
+            [enc setBuffer:kb[src] offset:0 atIndex:0];
+            [enc setBuffer:vb[src] offset:0 atIndex:1];
+            [enc setBuffer:kb[dst] offset:0 atIndex:2];
+            [enc setBuffer:vb[dst] offset:0 atIndex:3];
+            [enc setBuffer:hb offset:0 atIndex:4];
+            [enc setBytes:&n length:sizeof(n) atIndex:5];
+            [enc setBytes:&shift length:sizeof(shift) atIndex:6];
+            [enc setBytes:&num_blocks length:sizeof(num_blocks) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        [enc endEncoding];
+        if (passes & 1) {  // result is in the temporaries
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            [blit copyFromBuffer:kb[1] sourceOffset:0 toBuffer:kb[0] destinationOffset:0 size:(NSUInteger)n * 8];
+            [blit copyFromBuffer:vb[1] sourceOffset:0 toBuffer:vb[0] destinationOffset:0 size:(NSUInteger)n * 4];
+            [blit endEncoding];
+        }
+    });
+}
+
+void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    require_threads(ctx->knn_box_bounds_kernel_cpso, kScanTG, "knn_box_bounds_kernel");
+
+    // Bounds for Morton quantization (points are in shared memory; written by the
+    // caller or by GPU work that has completed)
+    msplat_gpu_sync();
+    const float *p = points.data<float>();
+    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (uint32_t i = 0; i < n; i++)
+        for (int k = 0; k < 3; k++) {
+            lo[k] = std::min(lo[k], p[3 * i + k]);
+            hi[k] = std::max(hi[k], p[3 * i + k]);
+        }
+    std::array<float, 6> bounds;  // std::array: blocks cannot capture C arrays
+    for (int k = 0; k < 3; k++) {
+        bounds[k] = lo[k];
+        float ext = hi[k] - lo[k];
+        bounds[3 + k] = ext > 0.f ? 1.f / ext : 0.f;
+    }
+
+    MTensor keys = mtensor_empty(dev, {(int64_t)n}, DType::Int64);
+    MTensor order = mtensor_empty(dev, {(int64_t)n}, DType::Int32);
+    MTensor sorted = mtensor_empty(dev, {(int64_t)n, 3}, DType::Float32);
+    uint32_t num_boxes = div_up(n, kKnnBox);
+    MTensor boxes = mtensor_empty(dev, {(int64_t)num_boxes, 6}, DType::Float32);
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->morton_codes_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->morton_codes_kernel_cpso];
+        ENC_BUF(enc, points, 0); ENC_SCALAR(enc, n, 1);
+        [enc setBytes:bounds.data() length:sizeof(float) * bounds.size() atIndex:2];
+        ENC_BUF(enc, keys, 3); ENC_BUF(enc, order, 4);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+
+    msplat_radix_sort(keys, order, n, 30);
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->gather_points_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->gather_points_kernel_cpso];
+        ENC_BUF(enc, points, 0); ENC_BUF(enc, order, 1); ENC_SCALAR(enc, n, 2); ENC_BUF(enc, sorted, 3);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:ctx->knn_box_bounds_kernel_cpso];
+        ENC_BUF(enc, sorted, 0); ENC_SCALAR(enc, n, 1); ENC_BUF(enc, boxes, 2);
+        [enc dispatchThreadgroups:MTLSizeMake(num_boxes, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        NSUInteger ktpg = MIN(ctx->knn3_mean_dist_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->knn3_mean_dist_kernel_cpso];
+        ENC_BUF(enc, sorted, 0); ENC_SCALAR(enc, n, 1); ENC_BUF(enc, boxes, 2);
+        ENC_SCALAR(enc, num_boxes, 3); ENC_BUF(enc, order, 4); ENC_BUF(enc, mean_dist, 5);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(ktpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t seed, float opacity_logit,
+                           MTensor &scales, MTensor &quats, MTensor &features_dc, MTensor &opacities) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    MTensor mean_dist = mtensor_empty(ctx->device, {(int64_t)n}, DType::Float32);
+    msplat_knn3_mean_dist(means, n, mean_dist);
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->init_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->init_gaussians_kernel_cpso];
+        ENC_BUF(enc, mean_dist, 0); ENC_BUF(enc, rgb, 1); ENC_SCALAR(enc, n, 2);
+        ENC_SCALAR(enc, seed, 3); ENC_SCALAR(enc, opacity_logit, 4);
+        ENC_BUF(enc, scales, 5); ENC_BUF(enc, quats, 6); ENC_BUF(enc, features_dc, 7); ENC_BUF(enc, opacities, 8);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+// ============================================================================
+// Image pipeline, evaluation metrics, display packing
+// ============================================================================
+
+// Must match UndistortParams in msplat_metal.metal.
+struct UndistortParamsGPU {
+    float fx, fy, cx, cy;
+    float k1, k2, p1, p2, k3;
+    uint32_t src_w, src_h, dst_w, dst_h, roi_x, roi_y, pad;
+};
+static_assert(sizeof(UndistortParamsGPU) == 64, "UndistortParamsGPU must match UndistortParams");
+
+static MTLSize grid2d_tg(id<MTLComputePipelineState> pso) {
+    NSUInteger w = 16, h = MIN((NSUInteger)16, pso.maxTotalThreadsPerThreadgroup / 16);
+    return MTLSizeMake(w, MAX((NSUInteger)1, h), 1);
+}
+
+void msplat_resize_area(const MTensor &src, bool src_is_u8, int sw, int sh, MTensor &dst, int dw, int dh) {
+    if (dw <= 0 || dh <= 0) return;
+    MetalContext* ctx = get_global_context();
+    g_tcache.ensure_dummies(ctx->device);
+    std::array<uint32_t, 4> dims = {{(uint32_t)sw, (uint32_t)sh, (uint32_t)dw, (uint32_t)dh}};
+    uint32_t is_u8 = src_is_u8 ? 1u : 0u;
+    id<MTLBuffer> u8 = src_is_u8 ? src.buffer() : g_tcache.dummy_aux.buffer();
+    id<MTLBuffer> f = src_is_u8 ? g_tcache.dummy_tex.buffer() : src.buffer();
+    id<MTLBuffer> out = dst.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->image_resize_area_kernel_cpso];
+        [enc setBuffer:u8 offset:0 atIndex:0];
+        [enc setBuffer:f offset:0 atIndex:1];
+        [enc setBytes:dims.data() length:sizeof(uint32_t) * dims.size() atIndex:2];
+        [enc setBytes:&is_u8 length:sizeof(is_u8) atIndex:3];
+        [enc setBuffer:out offset:0 atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(dw, dh, 1) threadsPerThreadgroup:grid2d_tg(ctx->image_resize_area_kernel_cpso)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_undistort(const MTensor &src, int sw, int sh, const float intr[4], const float dist[5],
+                      int roi_x, int roi_y, MTensor &dst, int dw, int dh) {
+    if (dw <= 0 || dh <= 0) return;
+    MetalContext* ctx = get_global_context();
+    UndistortParamsGPU p = {};
+    p.fx = intr[0]; p.fy = intr[1]; p.cx = intr[2]; p.cy = intr[3];
+    p.k1 = dist[0]; p.k2 = dist[1]; p.p1 = dist[2]; p.p2 = dist[3]; p.k3 = dist[4];
+    p.src_w = (uint32_t)sw; p.src_h = (uint32_t)sh; p.dst_w = (uint32_t)dw; p.dst_h = (uint32_t)dh;
+    p.roi_x = (uint32_t)roi_x; p.roi_y = (uint32_t)roi_y;
+    id<MTLBuffer> in = src.buffer(), out = dst.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->image_undistort_kernel_cpso];
+        [enc setBuffer:in offset:0 atIndex:0];
+        [enc setBytes:&p length:sizeof(p) atIndex:1];
+        [enc setBuffer:out offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(dw, dh, 1) threadsPerThreadgroup:grid2d_tg(ctx->image_undistort_kernel_cpso)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_image_metrics(const MTensor &rendered, const MTensor &gt, int h, int w, double out[3]) {
+    out[0] = out[1] = out[2] = 0.0;
+    if (h <= 0 || w <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    if (!g_tcache.eval_hbuf.defined() || g_tcache.eval_hbuf.numel() < (int64_t)h * w * 15)
+        g_tcache.eval_hbuf = mtensor_empty(dev, {(int64_t)h * w * 15}, DType::Float32);
+    MTLSize tg = MTLSizeMake(16, 16, 1);
+    require_threads(ctx->eval_ssim_v_kernel_cpso, 256, "eval_ssim_v_kernel");
+    uint32_t tgx = div_up((uint64_t)w, 16), tgy = div_up((uint64_t)h, 16);
+    if (!g_tcache.eval_partials.defined() || g_tcache.eval_partials.numel() < (int64_t)tgx * tgy * 3)
+        g_tcache.eval_partials = mtensor_empty(dev, {(int64_t)tgx * tgy * 3}, DType::Float32);
+    std::array<uint32_t, 2> size = {{(uint32_t)w, (uint32_t)h}};
+    id<MTLBuffer> a = rendered.buffer(), b = gt.buffer();
+    id<MTLBuffer> hbuf = g_tcache.eval_hbuf.buffer(), parts = g_tcache.eval_partials.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        [enc setComputePipelineState:ctx->eval_ssim_h_kernel_cpso];
+        [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1];
+        [enc setBytes:size.data() length:sizeof(uint32_t) * size.size() atIndex:2]; [enc setBuffer:hbuf offset:0 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:grid2d_tg(ctx->eval_ssim_h_kernel_cpso)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->eval_ssim_v_kernel_cpso];
+        [enc setBuffer:a offset:0 atIndex:0]; [enc setBuffer:b offset:0 atIndex:1];
+        [enc setBuffer:hbuf offset:0 atIndex:2]; [enc setBytes:size.data() length:sizeof(uint32_t) * size.size() atIndex:3];
+        [enc setBuffer:parts offset:0 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(tgx, tgy, 1) threadsPerThreadgroup:tg];
+        [enc endEncoding];
+    });
+    msplat_gpu_sync();
+    const float *pp = g_tcache.eval_partials.data<float>();
+    double ssim = 0, l1 = 0, sq = 0;
+    for (uint32_t g = 0; g < tgx * tgy; g++) {
+        ssim += pp[3 * g];
+        l1 += pp[3 * g + 1];
+        sq += pp[3 * g + 2];
+    }
+    double count = (double)h * w * 3;
+    double mse = sq / count;
+    out[0] = mse > 0 ? 10.0 * std::log10(1.0 / mse) : INFINITY;
+    out[1] = ssim / count;
+    out[2] = l1 / count;
+}
+
+void msplat_pack_rgba8(const MTensor &img, uint32_t n, uint8_t *out) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    if (!g_tcache.rgba8_out.defined() || g_tcache.rgba8_out.numel() < (int64_t)n)
+        g_tcache.rgba8_out = mtensor_empty(ctx->device, {(int64_t)n}, DType::Int32);
+    id<MTLBuffer> in = img.buffer(), packed = g_tcache.rgba8_out.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->pack_rgba8_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->pack_rgba8_kernel_cpso];
+        [enc setBuffer:in offset:0 atIndex:0];
+        [enc setBytes:&n length:sizeof(n) atIndex:1];
+        [enc setBuffer:packed offset:0 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+    msplat_gpu_sync();
+    memcpy(out, g_tcache.rgba8_out.data_ptr(), (size_t)n * 4);
+}
+
+void msplat_finalize_depth(const MTensor &depth_num, const MTensor &final_T, uint32_t n, float inv_scale,
+                           MTensor &depth_out, MTensor &alpha_out) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLBuffer> d = depth_num.buffer(), t = final_T.buffer(), od = depth_out.buffer(), oa = alpha_out.buffer();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->depth_finalize_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->depth_finalize_kernel_cpso];
+        [enc setBuffer:d offset:0 atIndex:0]; [enc setBuffer:t offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2]; [enc setBytes:&inv_scale length:sizeof(inv_scale) atIndex:3];
+        [enc setBuffer:od offset:0 atIndex:4]; [enc setBuffer:oa offset:0 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
 }
