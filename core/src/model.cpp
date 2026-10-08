@@ -1,16 +1,15 @@
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
-#include <random>
 #include "model.hpp"
-#include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
 #include "priors.hpp"
 
 namespace fs = std::filesystem;
-
-static const double C0 = 0.28209479177387814;
 
 int numShBases(int degree){
     switch(degree){
@@ -54,60 +53,28 @@ Model::Model(const InputData &inputData, int numCameras,
       maxSteps(maxSteps), keepCrs(keepCrs) {
 
     int64_t numPoints = inputData.points.count;
+    if (numPoints <= 0)
+        throw std::runtime_error("Dataset has no initial point cloud (points3D.bin / .ply) to initialize gaussians from");
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
 
-    // Means: copy xyz directly to GPU
+    // Upload points and colors; scales (exact 3-NN distance), random rotations,
+    // DC SH and opacities are then computed on the GPU.
     means = gpu_empty({numPoints, 3}, DType::Float32);
     memcpy(means.data_ptr(), inputData.points.xyz.data(), numPoints * 3 * sizeof(float));
+    MTensor rgb = gpu_empty({numPoints, 3}, DType::UInt8);
+    memcpy(rgb.data_ptr(), inputData.points.rgb.data(), numPoints * 3);
 
-    // Scales: KD-tree nearest neighbor distances, log'd, repeated 3x
-    {
-        PointsTensor pt(inputData.points.xyz.data(), numPoints);
-        auto sc = pt.scales();  // vector<float> of length numPoints
-        scales = gpu_empty({numPoints, 3}, DType::Float32);
-        float *sp = scales.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) {
-            float v = std::log(sc[i]);
-            sp[i*3] = sp[i*3+1] = sp[i*3+2] = v;
-        }
-    }
-
-    // Random quaternions
-    {
-        std::mt19937 rng(42);
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        quats = gpu_empty({numPoints, 4}, DType::Float32);
-        float *qp = quats.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) {
-            float u = dist(rng), v = dist(rng), w = dist(rng);
-            qp[i*4+0] = std::sqrt(1-u) * std::sin(2*M_PI*v);
-            qp[i*4+1] = std::sqrt(1-u) * std::cos(2*M_PI*v);
-            qp[i*4+2] = std::sqrt(u) * std::sin(2*M_PI*w);
-            qp[i*4+3] = std::sqrt(u) * std::cos(2*M_PI*w);
-        }
-    }
-
-    // SH features: f_dc = rgb2sh(rgb), f_rest = zeros
+    scales = gpu_empty({numPoints, 3}, DType::Float32);
+    quats = gpu_empty({numPoints, 4}, DType::Float32);
+    featuresDc = gpu_empty({numPoints, 3}, DType::Float32);
+    opacities = gpu_empty({numPoints, 1}, DType::Float32);
     int dimSh = numShBases(shDegree);
-    {
-        featuresDc = gpu_empty({numPoints, 3}, DType::Float32);
-        float *dp = featuresDc.data<float>();
-        const uint8_t *rgb = inputData.points.rgb.data();
-        for (int64_t i = 0; i < numPoints; i++) {
-            for (int c = 0; c < 3; c++)
-                dp[i*3+c] = (float)((rgb[i*3+c] / 255.0 - 0.5) / C0);
-        }
-        featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
-    }
+    featuresRest = gpu_zeros({numPoints, (int64_t)(dimSh - 1), 3}, DType::Float32);
 
-    // Opacities: logit(0.1) = log(0.1/0.9)
-    {
-        float logit01 = std::log(0.1f / 0.9f);
-        opacities = gpu_empty({numPoints, 1}, DType::Float32);
-        float *op = opacities.data<float>();
-        for (int64_t i = 0; i < numPoints; i++) op[i] = logit01;
-    }
+    const float logit01 = std::log(0.1f / 0.9f);  // initial opacity 0.1
+    msplat_init_gaussians(means, rgb, (uint32_t)numPoints, 42u, logit01,
+                          scales, quats, featuresDc, opacities);
 
     // Background color — default is magenta (high-contrast against typical scenes,
     // makes under-reconstructed regions obvious during training)
@@ -120,14 +87,14 @@ Model::Model(const InputData &inputData, int numCameras,
 void Model::setupOptimizers(){
     releaseOptimizers();
 
-
     num_active = means.size(0);
     buf_capacity = num_active * 4;
+    // GPU copies: the parameters may still be pending GPU work (msplat_init_gaussians)
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
         buf = gpu_zeros(shape, DType::Float32);
-        memcpy(buf.data_ptr(), param.data_ptr(), param.nbytes());
+        msplat_copy_buffer(buf, param, param.nbytes());
     };
     allocBuf(means_buf, means);
     allocBuf(scales_buf, scales);

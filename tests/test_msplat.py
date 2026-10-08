@@ -421,3 +421,45 @@ def test_street_config_overrides():
     assert cfg.learn_sky
     assert msplat.TrainingConfig().depth_weight == 0.0
     assert not msplat.TrainingConfig().learn_sky
+
+
+# ── GPU primitives (no dataset needed) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize("n,bits,hi", [
+    (1, 32, 10), (5, 32, 4), (1023, 32, 2**30), (1024, 32, 2**30), (1025, 32, 7),
+    (70_000, 32, 2**30), (5_000, 64, 2**63), (2_049, 64, 3),
+])
+def test_gpu_radix_sort_matches_numpy(n, bits, hi):
+    from msplat import _core
+
+    rng = np.random.default_rng(n + bits)
+    keys = rng.integers(0, hi, n, dtype=np.uint64)
+    sorted_keys, order = _core._gpu_radix_sort(keys, bits)
+    ref = np.argsort(keys, kind="stable")
+    np.testing.assert_array_equal(sorted_keys, keys[ref])
+    np.testing.assert_array_equal(order, ref)  # stable
+
+
+def _knn3_bruteforce(pts):
+    d2 = ((pts[:, None, :].astype(np.float64) - pts[None, :, :]) ** 2).sum(-1)
+    np.fill_diagonal(d2, np.inf)
+    return np.sqrt(np.sort(d2, axis=1)[:, :3]).mean(axis=1)
+
+
+@pytest.mark.parametrize("kind", ["uniform", "street", "duplicates"])
+def test_gpu_knn_matches_bruteforce(kind):
+    from msplat import _core
+
+    rng = np.random.default_rng(7)
+    if kind == "uniform":
+        pts = rng.uniform(-1, 1, (3000, 3))
+    elif kind == "street":  # thin road plane + facade + sparse far points
+        road = np.c_[rng.uniform(-20, 20, 2000), rng.normal(0, 0.02, 2000), rng.uniform(0, 80, 2000)]
+        facade = np.c_[8 + rng.normal(0, 0.05, 800), rng.uniform(0, 10, 800), rng.uniform(0, 80, 800)]
+        pts = np.vstack([road, facade, rng.normal(0, 300, (200, 3))])
+    else:
+        pts = np.vstack([rng.uniform(-1, 1, (500, 3)), np.repeat(rng.uniform(-1, 1, (8, 3)), 4, axis=0)])
+    pts = pts.astype(np.float32)
+    got = _core._gpu_knn3_mean_dist(pts)
+    np.testing.assert_allclose(got, _knn3_bruteforce(pts), rtol=1e-4, atol=1e-6)

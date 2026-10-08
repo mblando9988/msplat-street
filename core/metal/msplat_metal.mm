@@ -169,6 +169,16 @@ struct MetalContext {
     id<MTLComputePipelineState> scale_ratio_cap_kernel_cpso;
     // GPU-resident training utilities
     id<MTLComputePipelineState> opacity_reset_kernel_cpso;
+    // Scan / radix sort / GPU initialization
+    id<MTLComputePipelineState> scan_block_kernel_cpso;
+    id<MTLComputePipelineState> scan_add_kernel_cpso;
+    id<MTLComputePipelineState> radix_count_kernel_cpso;
+    id<MTLComputePipelineState> radix_scatter_kernel_cpso;
+    id<MTLComputePipelineState> morton_codes_kernel_cpso;
+    id<MTLComputePipelineState> gather_points_kernel_cpso;
+    id<MTLComputePipelineState> knn_box_bounds_kernel_cpso;
+    id<MTLComputePipelineState> knn3_mean_dist_kernel_cpso;
+    id<MTLComputePipelineState> init_gaussians_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -283,6 +293,16 @@ MetalContext* init_msplat_metal_context() {
     ctx->scale_ratio_cap_kernel_cpso              = load(@"scale_ratio_cap_kernel");
     // GPU-resident training utilities
     ctx->opacity_reset_kernel_cpso                = load(@"opacity_reset_kernel");
+    // Scan / radix sort / GPU initialization
+    ctx->scan_block_kernel_cpso                   = load(@"scan_block_kernel");
+    ctx->scan_add_kernel_cpso                     = load(@"scan_add_kernel");
+    ctx->radix_count_kernel_cpso                  = load(@"radix_count_kernel");
+    ctx->radix_scatter_kernel_cpso                = load(@"radix_scatter_kernel");
+    ctx->morton_codes_kernel_cpso                 = load(@"morton_codes_kernel");
+    ctx->gather_points_kernel_cpso                = load(@"gather_points_kernel");
+    ctx->knn_box_bounds_kernel_cpso               = load(@"knn_box_bounds_kernel");
+    ctx->knn3_mean_dist_kernel_cpso               = load(@"knn3_mean_dist_kernel");
+    ctx->init_gaussians_kernel_cpso               = load(@"init_gaussians_kernel");
 
     [metal_library release];
 
@@ -1997,5 +2017,200 @@ void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes) {
         id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
         [blit copyFromBuffer:s sourceOffset:0 toBuffer:d destinationOffset:0 size:bytes];
         [blit endEncoding];
+    });
+}
+
+// ============================================================================
+// Scan / stable radix sort / GPU initialization
+// ============================================================================
+
+// Must match RS_TG / RS_BLOCK / KNN_BOX in msplat_metal.metal.
+static constexpr uint32_t kScanTG = 256;
+static constexpr uint32_t kScanBlock = 1024;
+static constexpr uint32_t kKnnBox = 1024;
+
+static uint32_t div_up(uint64_t a, uint64_t b) { return (uint32_t)((a + b - 1) / b); }
+
+static void require_threads(id<MTLComputePipelineState> pso, NSUInteger threads, const char *name) {
+    if (pso.maxTotalThreadsPerThreadgroup < threads)
+        throw std::runtime_error(std::string("msplat: ") + name + " needs " + std::to_string(threads) +
+                                 " threads per threadgroup on this GPU");
+}
+
+// Partial-sum buffers for every level of a multi-level exclusive scan of n values.
+static std::vector<MTensor> scan_levels(id<MTLDevice> dev, uint32_t n) {
+    std::vector<MTensor> levels;
+    uint32_t m = n;
+    while (true) {
+        uint32_t nb = div_up(m, kScanBlock);
+        levels.push_back(mtensor_empty(dev, {(int64_t)nb}, DType::Int32));
+        if (nb <= 1) break;
+        m = nb;
+    }
+    return levels;
+}
+
+// Exclusive scan of n uint32 values in place: per-block scan, recursive scan of the
+// block sums, then add them back. Ends with no trailing barrier.
+static void encode_exclusive_scan(id<MTLComputeCommandEncoder> enc, MetalContext *ctx,
+                                  id<MTLBuffer> data, uint32_t n, std::vector<MTensor> *levels, size_t level) {
+    uint32_t nb = div_up(n, kScanBlock);
+    id<MTLBuffer> partials = (*levels)[level].buffer();
+    [enc setComputePipelineState:ctx->scan_block_kernel_cpso];
+    [enc setBuffer:data offset:0 atIndex:0];
+    [enc setBytes:&n length:sizeof(n) atIndex:1];
+    [enc setBuffer:partials offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+    if (nb <= 1) return;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    encode_exclusive_scan(enc, ctx, partials, nb, levels, level + 1);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [enc setComputePipelineState:ctx->scan_add_kernel_cpso];
+    [enc setBuffer:data offset:0 atIndex:0];
+    [enc setBytes:&n length:sizeof(n) atIndex:1];
+    [enc setBuffer:partials offset:0 atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(nb, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+}
+
+void msplat_radix_sort(MTensor &keys, MTensor &vals, uint32_t n, int key_bits) {
+    if (n <= 1 || key_bits <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    require_threads(ctx->radix_count_kernel_cpso, kScanTG, "radix_count_kernel");
+    require_threads(ctx->radix_scatter_kernel_cpso, kScanTG, "radix_scatter_kernel");
+    require_threads(ctx->scan_block_kernel_cpso, kScanTG, "scan_block_kernel");
+
+    uint32_t num_blocks = div_up(n, kScanBlock);
+    uint32_t hist_n = 256 * num_blocks;
+    MTensor keys_tmp = mtensor_empty(dev, {(int64_t)n}, DType::Int64);
+    MTensor vals_tmp = mtensor_empty(dev, {(int64_t)n}, DType::Int32);
+    MTensor hist = mtensor_empty(dev, {(int64_t)hist_n}, DType::Int32);
+    std::vector<MTensor> levels = scan_levels(dev, hist_n);
+    int passes = (std::min(key_bits, 64) + 7) / 8;
+
+    id<MTLBuffer> kb[2] = {keys.buffer(), keys_tmp.buffer()};
+    id<MTLBuffer> vb[2] = {vals.buffer(), vals_tmp.buffer()};
+    id<MTLBuffer> hb = hist.buffer();
+    std::vector<MTensor> *lv = &levels;
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        for (int pass = 0; pass < passes; pass++) {
+            uint32_t shift = 8u * (uint32_t)pass;
+            int src = pass & 1, dst = src ^ 1;
+            [enc setComputePipelineState:ctx->radix_count_kernel_cpso];
+            [enc setBuffer:kb[src] offset:0 atIndex:0];
+            [enc setBytes:&n length:sizeof(n) atIndex:1];
+            [enc setBytes:&shift length:sizeof(shift) atIndex:2];
+            [enc setBytes:&num_blocks length:sizeof(num_blocks) atIndex:3];
+            [enc setBuffer:hb offset:0 atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_exclusive_scan(enc, ctx, hb, hist_n, lv, 0);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->radix_scatter_kernel_cpso];
+            [enc setBuffer:kb[src] offset:0 atIndex:0];
+            [enc setBuffer:vb[src] offset:0 atIndex:1];
+            [enc setBuffer:kb[dst] offset:0 atIndex:2];
+            [enc setBuffer:vb[dst] offset:0 atIndex:3];
+            [enc setBuffer:hb offset:0 atIndex:4];
+            [enc setBytes:&n length:sizeof(n) atIndex:5];
+            [enc setBytes:&shift length:sizeof(shift) atIndex:6];
+            [enc setBytes:&num_blocks length:sizeof(num_blocks) atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(num_blocks, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        [enc endEncoding];
+        if (passes & 1) {  // result is in the temporaries
+            id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            [blit copyFromBuffer:kb[1] sourceOffset:0 toBuffer:kb[0] destinationOffset:0 size:(NSUInteger)n * 8];
+            [blit copyFromBuffer:vb[1] sourceOffset:0 toBuffer:vb[0] destinationOffset:0 size:(NSUInteger)n * 4];
+            [blit endEncoding];
+        }
+    });
+}
+
+void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLDevice> dev = ctx->device;
+    require_threads(ctx->knn_box_bounds_kernel_cpso, kScanTG, "knn_box_bounds_kernel");
+
+    // Bounds for Morton quantization (points are in shared memory; written by the
+    // caller or by GPU work that has completed)
+    msplat_gpu_sync();
+    const float *p = points.data<float>();
+    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (uint32_t i = 0; i < n; i++)
+        for (int k = 0; k < 3; k++) {
+            lo[k] = std::min(lo[k], p[3 * i + k]);
+            hi[k] = std::max(hi[k], p[3 * i + k]);
+        }
+    float bounds[6];
+    for (int k = 0; k < 3; k++) {
+        bounds[k] = lo[k];
+        float ext = hi[k] - lo[k];
+        bounds[3 + k] = ext > 0.f ? 1.f / ext : 0.f;
+    }
+
+    MTensor keys = mtensor_empty(dev, {(int64_t)n}, DType::Int64);
+    MTensor order = mtensor_empty(dev, {(int64_t)n}, DType::Int32);
+    MTensor sorted = mtensor_empty(dev, {(int64_t)n, 3}, DType::Float32);
+    uint32_t num_boxes = div_up(n, kKnnBox);
+    MTensor boxes = mtensor_empty(dev, {(int64_t)num_boxes, 6}, DType::Float32);
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->morton_codes_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->morton_codes_kernel_cpso];
+        ENC_BUF(enc, points, 0); ENC_SCALAR(enc, n, 1);
+        [enc setBytes:bounds length:sizeof(bounds) atIndex:2];
+        ENC_BUF(enc, keys, 3); ENC_BUF(enc, order, 4);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+
+    msplat_radix_sort(keys, order, n, 30);
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->gather_points_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->gather_points_kernel_cpso];
+        ENC_BUF(enc, points, 0); ENC_BUF(enc, order, 1); ENC_SCALAR(enc, n, 2); ENC_BUF(enc, sorted, 3);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:ctx->knn_box_bounds_kernel_cpso];
+        ENC_BUF(enc, sorted, 0); ENC_SCALAR(enc, n, 1); ENC_BUF(enc, boxes, 2);
+        [enc dispatchThreadgroups:MTLSizeMake(num_boxes, 1, 1) threadsPerThreadgroup:MTLSizeMake(kScanTG, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        NSUInteger ktpg = MIN(ctx->knn3_mean_dist_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->knn3_mean_dist_kernel_cpso];
+        ENC_BUF(enc, sorted, 0); ENC_SCALAR(enc, n, 1); ENC_BUF(enc, boxes, 2);
+        ENC_SCALAR(enc, num_boxes, 3); ENC_BUF(enc, order, 4); ENC_BUF(enc, mean_dist, 5);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(ktpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t seed, float opacity_logit,
+                           MTensor &scales, MTensor &quats, MTensor &features_dc, MTensor &opacities) {
+    if (n == 0) return;
+    MetalContext* ctx = get_global_context();
+    MTensor mean_dist = mtensor_empty(ctx->device, {(int64_t)n}, DType::Float32);
+    msplat_knn3_mean_dist(means, n, mean_dist);
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->init_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->init_gaussians_kernel_cpso];
+        ENC_BUF(enc, mean_dist, 0); ENC_BUF(enc, rgb, 1); ENC_SCALAR(enc, n, 2);
+        ENC_SCALAR(enc, seed, 3); ENC_SCALAR(enc, opacity_logit, 4);
+        ENC_BUF(enc, scales, 5); ENC_BUF(enc, quats, 6); ENC_BUF(enc, features_dc, 7); ENC_BUF(enc, opacities, 8);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
     });
 }

@@ -142,4 +142,17 @@ void msplat_opacity_reset(MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg
 // GPU copy of the first `bytes` of src into dst, ordered after the in-flight work.
 void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes);
 
+// Stable LSD radix sort of (keys: Int64 [n], vals: Int32 [n]) by the low key_bits bits
+// of the keys, in place on the GPU. Encoded into the in-flight command buffer.
+void msplat_radix_sort(MTensor &keys, MTensor &vals, uint32_t n, int key_bits);
+
+// Exact mean distance from each of n points (n, 3) to its 3 nearest other points,
+// written to mean_dist (n). Morton-ordered boxes with distance culling (simple-knn).
+void msplat_knn3_mean_dist(MTensor &points, uint32_t n, MTensor &mean_dist);
+
+// Gaussian initialization from points (n, 3) and colors (n, 3 uint8), entirely on the
+// GPU: 3-NN isotropic log-scales, uniformly random rotations, DC SH, constant opacity.
+void msplat_init_gaussians(MTensor &means, MTensor &rgb, uint32_t n, uint32_t seed, float opacity_logit,
+                           MTensor &scales, MTensor &quats, MTensor &features_dc, MTensor &opacities);
+
 #endif

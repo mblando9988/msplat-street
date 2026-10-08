@@ -575,6 +575,43 @@ NB_MODULE(_core, m) {
         .def_prop_ro("iteration", [](const GaussianTrainer &t) { return t.current_step; },
             "Current training iteration.");
 
+    // Test hooks for the GPU primitives (validated against NumPy in tests/)
+    m.def("_gpu_radix_sort", [](nb::ndarray<const uint64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu> keys,
+                                int key_bits) {
+        size_t n = keys.shape(0);
+        MTensor k = gpu_empty({(int64_t)std::max<size_t>(n, 1)}, DType::Int64);
+        MTensor v = gpu_empty({(int64_t)std::max<size_t>(n, 1)}, DType::Int32);
+        memcpy(k.data_ptr(), keys.data(), n * sizeof(uint64_t));
+        uint32_t *vp = v.data<uint32_t>();
+        for (size_t i = 0; i < n; i++) vp[i] = (uint32_t)i;
+        msplat_radix_sort(k, v, (uint32_t)n, key_bits);
+        msplat_gpu_sync();
+        uint64_t *ko = new uint64_t[std::max<size_t>(n, 1)];
+        uint32_t *vo = new uint32_t[std::max<size_t>(n, 1)];
+        memcpy(ko, k.data_ptr(), n * sizeof(uint64_t));
+        memcpy(vo, v.data_ptr(), n * sizeof(uint32_t));
+        nb::capsule kd(ko, [](void *p) noexcept { delete[] static_cast<uint64_t*>(p); });
+        nb::capsule vd(vo, [](void *p) noexcept { delete[] static_cast<uint32_t*>(p); });
+        size_t shape[1] = {n};
+        return nb::make_tuple(nb::ndarray<nb::numpy, uint64_t>(ko, 1, shape, kd),
+                              nb::ndarray<nb::numpy, uint32_t>(vo, 1, shape, vd));
+    }, "keys"_a, "key_bits"_a = 64,
+       "Stable GPU radix sort of uint64 keys. Returns (sorted_keys, order).");
+    m.def("_gpu_knn3_mean_dist", [](nb::ndarray<const float, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> points) {
+        size_t n = points.shape(0);
+        if (n == 0) throw std::invalid_argument("points must not be empty");
+        MTensor p = gpu_empty({(int64_t)n, 3}, DType::Float32);
+        memcpy(p.data_ptr(), points.data(), n * 3 * sizeof(float));
+        MTensor d = gpu_empty({(int64_t)n}, DType::Float32);
+        msplat_knn3_mean_dist(p, (uint32_t)n, d);
+        msplat_gpu_sync();
+        float *out = new float[n];
+        memcpy(out, d.data_ptr(), n * sizeof(float));
+        nb::capsule del(out, [](void *q) noexcept { delete[] static_cast<float*>(q); });
+        size_t shape[1] = {n};
+        return nb::ndarray<nb::numpy, float>(out, 1, shape, del);
+    }, "points"_a, "Exact mean distance to the 3 nearest other points, computed on the GPU.");
+
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");
     m.def("cleanup", &cleanup_msplat_metal, "Release all cached GPU resources");

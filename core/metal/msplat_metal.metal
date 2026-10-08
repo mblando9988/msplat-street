@@ -4434,3 +4434,370 @@ kernel void opacity_reset_kernel(
     exp_avg[idx] = 0.f;
     exp_avg_sq[idx] = 0.f;
 }
+
+// ============================================================================
+// Exclusive scan and stable LSD radix sort
+// General-purpose primitives used by GPU initialization (Morton ordering for KNN)
+// and depth-prior fusion (voxel keys). Keys are 64-bit; sort only as many 8-bit
+// digits as the keys use. Threadgroups are RS_TG threads owning RS_EPT consecutive
+// slots each, so one threadgroup covers RS_BLOCK elements.
+// ============================================================================
+
+#define RS_TG 256
+#define RS_EPT 4
+#define RS_BLOCK (RS_TG * RS_EPT)
+
+// Exclusive prefix sum of one value per thread across the threadgroup; `total` gets
+// the threadgroup sum. Contains barriers: every thread of the threadgroup must call it.
+inline uint tg_exclusive_scan(uint x, threadgroup uint* sg_sums, uint sg, uint lane,
+                              uint simd_width, uint num_threads, thread uint& total) {
+    uint pre = simd_prefix_exclusive_sum(x);
+    uint s = simd_sum(x);
+    if (lane == 0) sg_sums[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint n_sg = (num_threads + simd_width - 1) / simd_width;
+    uint off = 0, tot = 0;
+    for (uint k = 0; k < n_sg; k++) {
+        uint v = sg_sums[k];
+        if (k < sg) off += v;
+        tot += v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);  // sg_sums is reused by the next call
+    total = tot;
+    return off + pre;
+}
+
+// Exclusive scan of RS_BLOCK-element blocks in place; each block's sum goes to partials.
+// Scan partials (recursively), then add them back with scan_add_kernel.
+kernel void scan_block_kernel(
+    device uint* data                   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device uint* partials               [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    threadgroup uint sg_sums[32];
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    uint v[RS_EPT];
+    uint s = 0;
+    for (uint j = 0; j < RS_EPT; j++) {
+        v[j] = (base + j < n) ? data[base + j] : 0u;
+        s += v[j];
+    }
+    uint total;
+    uint run = tg_exclusive_scan(s, sg_sums, sg, lane, simd_width, RS_TG, total);
+    for (uint j = 0; j < RS_EPT; j++) {
+        if (base + j < n) data[base + j] = run;
+        run += v[j];
+    }
+    if (tid == 0) partials[block] = total;
+}
+
+kernel void scan_add_kernel(
+    device uint* data                   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device const uint* partials         [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]]
+) {
+    uint add = partials[block];
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    for (uint j = 0; j < RS_EPT; j++)
+        if (base + j < n) data[base + j] += add;
+}
+
+// Per-block histogram of one 8-bit digit, stored digit-major (hist[d * num_blocks + b])
+// so that a single exclusive scan yields every block's global start for every digit.
+kernel void radix_count_kernel(
+    device const ulong* keys            [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    constant uint& shift                [[buffer(2)]],
+    constant uint& num_blocks           [[buffer(3)]],
+    device uint* hist                   [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]]
+) {
+    threadgroup atomic_uint counts[256];
+    atomic_store_explicit(&counts[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint base = block * RS_BLOCK + tid * RS_EPT;
+    for (uint j = 0; j < RS_EPT; j++) {
+        if (base + j < n) {
+            uint d = (uint)(keys[base + j] >> shift) & 0xFFu;
+            atomic_fetch_add_explicit(&counts[d], 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    hist[tid * num_blocks + block] = atomic_load_explicit(&counts[tid], memory_order_relaxed);
+}
+
+// Stable scatter for one digit. The block is first sorted locally by the digit with
+// eight stable 1-bit splits in threadgroup memory; an element's rank among same-digit
+// elements of its block is then its local position minus the digit's local start.
+// Padding slots (past n) hold all-ones keys: they sort to the end of the block, so
+// valid elements are exactly local positions < n_valid.
+kernel void radix_scatter_kernel(
+    device const ulong* keys_in         [[buffer(0)]],
+    device const uint* vals_in          [[buffer(1)]],
+    device ulong* keys_out              [[buffer(2)]],
+    device uint* vals_out               [[buffer(3)]],
+    device const uint* offsets          [[buffer(4)]],  // exclusive scan of radix_count's hist
+    constant uint& n                    [[buffer(5)]],
+    constant uint& shift                [[buffer(6)]],
+    constant uint& num_blocks           [[buffer(7)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
+) {
+    threadgroup ulong sk[2][RS_BLOCK];
+    threadgroup uint sv[2][RS_BLOCK];
+    threadgroup uint sg_sums[32];
+    threadgroup uint digit_start[256];
+    threadgroup atomic_uint digit_count[256];
+
+    uint base = block * RS_BLOCK;
+    uint n_valid = min((uint)RS_BLOCK, n - base);
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        bool valid = p < n_valid;
+        sk[0][p] = valid ? keys_in[base + p] : ~0ul;
+        sv[0][p] = valid ? vals_in[base + p] : 0u;
+    }
+    atomic_store_explicit(&digit_count[tid], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint cur = 0;
+    for (uint bit = 0; bit < 8; bit++) {
+        uint f[RS_EPT];
+        uint cnt = 0;
+        for (uint j = 0; j < RS_EPT; j++) {
+            f[j] = (uint)(sk[cur][tid * RS_EPT + j] >> (shift + bit)) & 1u;
+            cnt += f[j];
+        }
+        uint total_ones;
+        uint ones_before = tg_exclusive_scan(cnt, sg_sums, sg, lane, simd_width, RS_TG, total_ones);
+        uint zeros_total = RS_BLOCK - total_ones;
+        for (uint j = 0; j < RS_EPT; j++) {
+            uint p = tid * RS_EPT + j;
+            uint dst = f[j] ? (zeros_total + ones_before) : (p - ones_before);
+            sk[1 - cur][dst] = sk[cur][p];
+            sv[1 - cur][dst] = sv[cur][p];
+            ones_before += f[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cur = 1 - cur;
+    }
+
+    uint d[RS_EPT];
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        d[j] = (uint)(sk[cur][p] >> shift) & 0xFFu;
+        if (p < n_valid) atomic_fetch_add_explicit(&digit_count[d[j]], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint unused_total;
+    digit_start[tid] = tg_exclusive_scan(atomic_load_explicit(&digit_count[tid], memory_order_relaxed),
+                                         sg_sums, sg, lane, simd_width, RS_TG, unused_total);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < RS_EPT; j++) {
+        uint p = tid * RS_EPT + j;
+        if (p >= n_valid) continue;
+        uint g = offsets[d[j] * num_blocks + block] + (p - digit_start[d[j]]);
+        keys_out[g] = sk[cur][p];
+        vals_out[g] = sv[cur][p];
+    }
+}
+
+// ============================================================================
+// GPU initialization: exact 3-NN scales + gaussian attributes
+// Port of the simple-knn scheme the reference 3DGS uses: points sorted by 30-bit
+// Morton code, grouped into boxes of KNN_BOX consecutive points; each point's
+// candidate set is seeded from its sorted neighbours, then every box closer than
+// the current third-best distance is scanned. Exact, not approximate.
+// ============================================================================
+
+#define KNN_BOX 1024
+#define KNN_TILE 256   // boxes staged in threadgroup memory per pass
+
+inline uint morton_expand10(uint v) {
+    v &= 0x3FFu;
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+kernel void morton_codes_kernel(
+    device const float* points          [[buffer(0)]],  // (N, 3)
+    constant uint& n                    [[buffer(1)]],
+    constant float* bounds              [[buffer(2)]],  // lo.xyz, 1 / extent.xyz
+    device ulong* keys                  [[buffer(3)]],
+    device uint* vals                   [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    float3 p = read_packed_float3(points, (int)i);
+    float3 q = clamp((p - float3(bounds[0], bounds[1], bounds[2])) *
+                     float3(bounds[3], bounds[4], bounds[5]), float3(0.f), float3(1.f)) * 1023.f;
+    uint code = (morton_expand10((uint)q.x) << 2) | (morton_expand10((uint)q.y) << 1) |
+                morton_expand10((uint)q.z);
+    keys[i] = (ulong)code;
+    vals[i] = i;
+}
+
+kernel void gather_points_kernel(
+    device const float* points          [[buffer(0)]],  // (N, 3)
+    device const uint* order            [[buffer(1)]],
+    constant uint& n                    [[buffer(2)]],
+    device float* sorted_points         [[buffer(3)]],  // (N, 3)
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    write_packed_float3(sorted_points, (int)i, read_packed_float3(points, (int)order[i]));
+}
+
+// One threadgroup per box: bounds of KNN_BOX consecutive sorted points.
+kernel void knn_box_bounds_kernel(
+    device const float* sorted_points   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device float* boxes                 [[buffer(2)]],  // (num_boxes, 6): lo.xyz, hi.xyz
+    uint tid [[thread_index_in_threadgroup]],
+    uint box [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float lo_s[3][RS_TG];
+    threadgroup float hi_s[3][RS_TG];
+    float3 lo = float3(INFINITY), hi = float3(-INFINITY);
+    uint end = min(n, (box + 1) * KNN_BOX);
+    for (uint i = box * KNN_BOX + tid; i < end; i += tg_size) {
+        float3 p = read_packed_float3(sorted_points, (int)i);
+        lo = min(lo, p);
+        hi = max(hi, p);
+    }
+    lo_s[0][tid] = lo.x; lo_s[1][tid] = lo.y; lo_s[2][tid] = lo.z;
+    hi_s[0][tid] = hi.x; hi_s[1][tid] = hi.y; hi_s[2][tid] = hi.z;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 6) {
+        uint axis = tid % 3;
+        bool is_hi = tid >= 3;
+        float v = is_hi ? -INFINITY : INFINITY;
+        for (uint k = 0; k < tg_size; k++)
+            v = is_hi ? max(v, hi_s[axis][k]) : min(v, lo_s[axis][k]);
+        boxes[box * 6 + tid] = v;
+    }
+}
+
+inline void knn_insert3(float d, thread float3& best) {
+    if (d >= best.z) return;
+    if (d < best.y) {
+        best.z = best.y;
+        if (d < best.x) { best.y = best.x; best.x = d; }
+        else best.y = d;
+    } else {
+        best.z = d;
+    }
+}
+
+inline float box_dist2(float3 p, float3 lo, float3 hi) {
+    float3 d = max(max(lo - p, p - hi), float3(0.f));
+    return dot(d, d);
+}
+
+// Mean distance to the 3 nearest other points, written in the points' original order.
+kernel void knn3_mean_dist_kernel(
+    device const float* sorted_points   [[buffer(0)]],
+    constant uint& n                    [[buffer(1)]],
+    device const float* boxes           [[buffer(2)]],
+    constant uint& num_boxes            [[buffer(3)]],
+    device const uint* order            [[buffer(4)]],
+    device float* mean_dist             [[buffer(5)]],  // (N,), original order
+    uint i [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float tile[KNN_TILE * 6];
+    const bool active = i < n;
+    float3 p = active ? read_packed_float3(sorted_points, (int)i) : float3(0.f);
+
+    // Seed the bound from neighbours in Morton order
+    float3 best = float3(INFINITY);
+    if (active) {
+        uint j0 = (i >= 3) ? i - 3 : 0;
+        uint j1 = min(n - 1, i + 3);
+        for (uint j = j0; j <= j1; j++) {
+            if (j == i) continue;
+            float3 d = read_packed_float3(sorted_points, (int)j) - p;
+            knn_insert3(dot(d, d), best);
+        }
+    }
+    const float reject = best.z;
+    best = float3(INFINITY);
+
+    for (uint t0 = 0; t0 < num_boxes; t0 += KNN_TILE) {
+        for (uint k = tid; k < KNN_TILE * 6; k += tg_size)
+            tile[k] = (t0 * 6 + k < num_boxes * 6) ? boxes[t0 * 6 + k] : 0.f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (active) {
+            uint count = min((uint)KNN_TILE, num_boxes - t0);
+            for (uint k = 0; k < count; k++) {
+                float3 lo = float3(tile[6 * k], tile[6 * k + 1], tile[6 * k + 2]);
+                float3 hi = float3(tile[6 * k + 3], tile[6 * k + 4], tile[6 * k + 5]);
+                float bd = box_dist2(p, lo, hi);
+                if (bd > reject || bd > best.z) continue;
+                uint s = (t0 + k) * KNN_BOX;
+                uint e = min(n, s + KNN_BOX);
+                for (uint j = s; j < e; j++) {
+                    if (j == i) continue;
+                    float3 d = read_packed_float3(sorted_points, (int)j) - p;
+                    knn_insert3(dot(d, d), best);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (active) {
+        float sum = 0.f, cnt = 0.f;
+        if (isfinite(best.x)) { sum += sqrt(best.x); cnt += 1.f; }
+        if (isfinite(best.y)) { sum += sqrt(best.y); cnt += 1.f; }
+        if (isfinite(best.z)) { sum += sqrt(best.z); cnt += 1.f; }
+        mean_dist[order[i]] = cnt > 0.f ? sum / cnt : 1.f;
+    }
+}
+
+// Gaussian attributes from points: isotropic log-scale from the 3-NN distance,
+// uniformly random rotation (Shoemake), DC SH from the point color, constant opacity.
+kernel void init_gaussians_kernel(
+    device const float* mean_dist       [[buffer(0)]],  // (N,)
+    device const uchar* rgb             [[buffer(1)]],  // (N, 3)
+    constant uint& n                    [[buffer(2)]],
+    constant uint& seed                 [[buffer(3)]],
+    constant float& opacity_logit       [[buffer(4)]],
+    device float* scales                [[buffer(5)]],  // (N, 3) log-space
+    device float* quats                 [[buffer(6)]],  // (N, 4)
+    device float* features_dc           [[buffer(7)]],  // (N, 3)
+    device float* opacities             [[buffer(8)]],  // (N, 1)
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= n) return;
+    // Coincident points would give log(0); clamp like the reference implementation.
+    float s = log(max(mean_dist[i], 1e-7f));
+    scales[3 * i] = s; scales[3 * i + 1] = s; scales[3 * i + 2] = s;
+
+    float u = rand_uniform(seed, 3u * i), v = rand_uniform(seed, 3u * i + 1u), w = rand_uniform(seed, 3u * i + 2u);
+    quats[4 * i + 0] = sqrt(1.f - u) * sin(2.f * M_PI_F * v);
+    quats[4 * i + 1] = sqrt(1.f - u) * cos(2.f * M_PI_F * v);
+    quats[4 * i + 2] = sqrt(u) * sin(2.f * M_PI_F * w);
+    quats[4 * i + 3] = sqrt(u) * cos(2.f * M_PI_F * w);
+
+    for (uint c = 0; c < 3; c++)
+        features_dc[3 * i + c] = ((float)rgb[3 * i + c] * (1.f / 255.f) - 0.5f) / SH_C0;
+    opacities[i] = opacity_logit;
+}
