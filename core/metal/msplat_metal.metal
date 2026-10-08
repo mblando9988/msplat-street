@@ -3482,6 +3482,30 @@ kernel void ssim_v_bwd_kernel(
 #define DENSIFY_SPLIT   1
 #define DENSIFY_DUP     2
 
+// Counter-based RNG: each (seed, counter) pair hashes to an independent value, so
+// kernels draw random numbers in place instead of reading a CPU-filled buffer.
+inline uint pcg_hash(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// Uniform in (0, 1): 24 random bits, offset by half a step so log() never sees 0.
+inline float rand_uniform(uint seed, uint counter) {
+    uint h = pcg_hash(seed ^ pcg_hash(counter));
+    return ((float)(h >> 8) + 0.5f) * (1.0f / 16777216.0f);
+}
+
+// Three independent standard normals for stream `stream` (Box-Muller, 4 uniforms).
+inline float3 rand_normal3(uint seed, uint stream) {
+    uint c = stream * 4u;
+    float u0 = rand_uniform(seed, c), u1 = rand_uniform(seed, c + 1u);
+    float u2 = rand_uniform(seed, c + 2u), u3 = rand_uniform(seed, c + 3u);
+    float r0 = sqrt(-2.0f * log(u0)), r1 = sqrt(-2.0f * log(u2));
+    float t0 = 2.0f * M_PI_F * u1, t1 = 2.0f * M_PI_F * u3;
+    return float3(r0 * cos(t0), r0 * sin(t0), r1 * cos(t1));
+}
+
 // Classify each gaussian as split, dup, or nothing based on gradient and scale thresholds.
 kernel void densify_classify_kernel(
     constant int& N,
@@ -3522,11 +3546,12 @@ kernel void densify_classify_kernel(
 // Append split children into backing buffers. One thread per original gaussian.
 // Each split gaussian produces 2 children at [N + 2*(ord)], [N + 2*(ord)+1].
 // Also shrinks parent scale by 1/1.6 and zeros optimizer state for children.
+// Child offsets are N(0, parent scale) draws from the in-kernel RNG, one stream per child.
 kernel void densify_append_split_kernel(
     constant int& N,
     constant int* split_flag         [[buffer(1)]],
     constant int* split_prefix       [[buffer(2)]],  // inclusive prefix sum
-    constant float* random_samples   [[buffer(3)]],  // [2*N, 3] randn
+    constant uint& seed              [[buffer(3)]],  // per-densification RNG seed
     constant float& log_size_fac     [[buffer(4)]],  // log(1.6)
     device float* means_buf          [[buffer(5)]],
     device float* scales_buf         [[buffer(6)]],
@@ -3567,12 +3592,12 @@ kernel void densify_append_split_kernel(
     // For each of 2 children
     for (int k = 0; k < 2; k++) {
         int child = (k == 0) ? c0 : c1;
-        int rand_idx = ord * 2 + k;
 
-        // Scale random sample by parent scale
-        float r0 = random_samples[rand_idx*3]   * sx;
-        float r1 = random_samples[rand_idx*3+1] * sy;
-        float r2 = random_samples[rand_idx*3+2] * sz;
+        // Standard-normal sample scaled by parent scale
+        float3 n = rand_normal3(seed, (uint)(ord * 2 + k));
+        float r0 = n.x * sx;
+        float r1 = n.y * sy;
+        float r2 = n.z * sz;
 
         // Rotate by parent quaternion: v' = R @ v
         float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;
@@ -4387,4 +4412,25 @@ kernel void scale_ratio_cap_kernel(
     if (a == mx) scales[3 * idx] = cap;
     else if (b == mx) scales[3 * idx + 1] = cap;
     else scales[3 * idx + 2] = cap;
+}
+
+// ============================================================================
+// GPU-resident training utilities (formerly host loops)
+// ============================================================================
+
+// Opacity reset: clamp every opacity logit to at most reset_logit and clear the
+// opacity group's Adam moments. Encoded into the training command buffer, so the
+// host neither waits for the GPU nor touches the parameters.
+kernel void opacity_reset_kernel(
+    device float* opacities             [[buffer(0)]],  // (N,) logits
+    device float* exp_avg               [[buffer(1)]],
+    device float* exp_avg_sq            [[buffer(2)]],
+    constant uint& num_points           [[buffer(3)]],
+    constant float& reset_logit         [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= num_points) return;
+    opacities[idx] = min(opacities[idx], reset_logit);
+    exp_avg[idx] = 0.f;
+    exp_avg_sq[idx] = 0.f;
 }

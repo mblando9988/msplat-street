@@ -159,7 +159,6 @@ void Model::setupOptimizers(){
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
 }
@@ -174,7 +173,7 @@ void Model::releaseOptimizers(){
     densify_split_flag.reset(); densify_dup_flag.reset();
     densify_split_prefix.reset(); densify_dup_prefix.reset();
     densify_keep_flag.reset(); densify_keep_prefix.reset();
-    densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    densify_block_totals.reset(); densify_compact_scratch.reset();
 }
 
 void Model::schedulersStep(int step){
@@ -199,12 +198,16 @@ void Model::ensureCapacity(int needed){
     if (needed <= buf_capacity) return;
     int new_cap = std::max(needed, buf_capacity * 2);
 
+    // The copy is a GPU blit encoded after this step's work, so it carries this step's
+    // Adam update. A CPU memcpy here would read the buffers before the GPU wrote them,
+    // and race with the previous command buffer still in flight. The old buffers stay
+    // alive until the command buffer that references them completes.
     auto grow = [&](MTensor &buf) {
         auto shape = buf.shape();
         shape[0] = new_cap;
         MTensor new_buf = gpu_zeros(shape, DType::Float32);
-        size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
-        memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
+        size_t copy_bytes = (size_t)num_active * buf.stride0() * sizeof(float);
+        msplat_copy_buffer(new_buf, buf, copy_bytes);
         buf = new_buf;
     };
     grow(means_buf); grow(scales_buf); grow(quats_buf);
@@ -223,7 +226,6 @@ void Model::ensureCapacity(int needed){
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
 
     buf_capacity = new_cap;
     refreshViews();
@@ -245,14 +247,6 @@ void Model::afterTrain(int step){
             int numPointsBefore = num_active;
             ensureCapacity(3 * num_active);  // worst case: every gaussian splits
 
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * num_active * 3; i++) p[i] = dist(rng);
-            }
-
             float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
             int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
             bool checkHuge = step > refineEvery * resetAlphaEvery;
@@ -270,7 +264,7 @@ void Model::afterTrain(int step){
                 densify_split_prefix, densify_dup_prefix,
                 densify_keep_flag, densify_keep_prefix,
                 densify_block_totals, densify_compact_scratch,
-                densify_random_samples
+                (uint32_t)step * 2654435761u  // split offsets drawn on the GPU
             );
 
             num_active = new_count;
@@ -279,14 +273,8 @@ void Model::afterTrain(int step){
         }
 
         if (step < stopSplitAt && step % resetInterval == refineEvery){
-            msplat_gpu_sync();
-            constexpr float resetLogit = -1.3862943611198906f;
-            float *op = opacities.data<float>();
-            for (int64_t i = 0; i < opacities.numel(); i++)
-                if (op[i] > resetLogit) op[i] = resetLogit;
-
-            adam_exp_avg[5].zero();
-            adam_exp_avg_sq[5].zero();
+            constexpr float resetLogit = -1.3862943611198906f;  // logit(0.2)
+            msplat_opacity_reset(opacities, adam_exp_avg[5], adam_exp_avg_sq[5], num_active, resetLogit);
             fprintf(stderr, "Opacity reset at step %d\n", step);
         }
 
@@ -538,7 +526,6 @@ int Model::loadCheckpoint(const std::string &filename) {
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
     densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
 

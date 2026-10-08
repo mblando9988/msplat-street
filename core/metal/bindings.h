@@ -131,7 +131,15 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    uint32_t seed  // split offsets are drawn in-kernel from this seed
 );
+
+// Opacity reset on the GPU: opacity logits clamped to <= reset_logit, Adam moments
+// of the opacity group cleared. Encoded after the in-flight step; no host sync.
+void msplat_opacity_reset(MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+                          int num_points, float reset_logit);
+
+// GPU copy of the first `bytes` of src into dst, ordered after the in-flight work.
+void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes);
 
 #endif

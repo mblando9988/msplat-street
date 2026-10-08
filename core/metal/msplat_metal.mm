@@ -167,6 +167,8 @@ struct MetalContext {
     id<MTLComputePipelineState> exposure_backward_kernel_cpso;
     id<MTLComputePipelineState> exposure_adam_kernel_cpso;
     id<MTLComputePipelineState> scale_ratio_cap_kernel_cpso;
+    // GPU-resident training utilities
+    id<MTLComputePipelineState> opacity_reset_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -279,6 +281,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->exposure_backward_kernel_cpso            = load(@"exposure_backward_kernel");
     ctx->exposure_adam_kernel_cpso                = load(@"exposure_adam_kernel");
     ctx->scale_ratio_cap_kernel_cpso              = load(@"scale_ratio_cap_kernel");
+    // GPU-resident training utilities
+    ctx->opacity_reset_kernel_cpso                = load(@"opacity_reset_kernel");
 
     [metal_library release];
 
@@ -476,7 +480,7 @@ struct FusedTensorCache {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         }
         if (!overflow_flag.defined()) {
-            overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
+            overflow_flag = mtensor_zeros(dev, {1}, DType::Int32);  // sticky, never cleared
         }
     }
 
@@ -607,20 +611,15 @@ static void forward_pipeline(
     const bool aux = prior && prior->aux;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians).
+    // The flag is sticky (never cleared), so peeking at it in shared memory without a
+    // sync only delays the warning until the GPU has written it — no pipeline drain.
     static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
+    if (!overflow_warned && g_tcache.overflow_flag.defined()
+        && *g_tcache.overflow_flag.data<int32_t>() > 0) {
+        fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                "Some gaussians were dropped from overfull tiles.\n");
+        overflow_warned = true;
     }
     // scatter_to_prealloc_bins clamps every tile counter to MAX_TILE_ELEMS, so the
     // prefix sum over them cannot exceed num_tiles * MAX_TILE_ELEMS. This is the only
@@ -880,7 +879,6 @@ static void forward_pipeline(
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
             // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-            [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
 
@@ -954,20 +952,15 @@ std::tuple<MTensor, float> msplat_train_step(
     const bool scale_cap = prior && prior->log_max_scale_ratio > 0.f;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
+    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians).
+    // The flag is sticky (never cleared), so peeking at it in shared memory without a
+    // sync only delays the warning until the GPU has written it — no pipeline drain.
     static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
-            overflow_warned = true;
-        }
+    if (!overflow_warned && g_tcache.overflow_flag.defined()
+        && *g_tcache.overflow_flag.data<int32_t>() > 0) {
+        fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
+                "Some gaussians were dropped from overfull tiles.\n");
+        overflow_warned = true;
     }
     // scatter_to_prealloc_bins clamps every tile counter to MAX_TILE_ELEMS, so the
     // prefix sum over them cannot exceed num_tiles * MAX_TILE_ELEMS. This is the only
@@ -1508,7 +1501,6 @@ std::tuple<MTensor, float> msplat_train_step(
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-        [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
@@ -1729,7 +1721,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    uint32_t seed
 ) {
     MetalContext* ctx = get_global_context();
 
@@ -1829,7 +1821,7 @@ int msplat_densify(
             ENC_SCALAR(enc, N_u32, 0);
             ENC_BUF(enc, split_flag, 1);
             ENC_BUF(enc, split_prefix, 2);
-            ENC_BUF(enc, random_samples, 3);
+            ENC_SCALAR(enc, seed, 3);
             ENC_SCALAR(enc, log_size_fac, 4);
             ENC_BUF(enc, means_buf, 5);
             ENC_BUF(enc, scales_buf, 6);
@@ -1970,4 +1962,40 @@ int msplat_densify(
     ctx->syncCB();
     int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
     return new_count;
+}
+
+// ============================================================================
+// GPU-resident training utilities
+// Both encode into the in-flight command buffer, after the work already encoded
+// for this step, so they see its results without the host waiting on the GPU.
+// ============================================================================
+
+void msplat_opacity_reset(MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+                          int num_points, float reset_logit) {
+    if (num_points <= 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    uint32_t n = (uint32_t)num_points;
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        NSUInteger tpg = MIN(ctx->opacity_reset_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        [enc setComputePipelineState:ctx->opacity_reset_kernel_cpso];
+        ENC_BUF(enc, opacities, 0); ENC_BUF(enc, exp_avg, 1); ENC_BUF(enc, exp_avg_sq, 2);
+        ENC_SCALAR(enc, n, 3); ENC_SCALAR(enc, reset_logit, 4);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc endEncoding];
+    });
+}
+
+void msplat_copy_buffer(MTensor &dst, const MTensor &src, size_t bytes) {
+    if (bytes == 0) return;
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    id<MTLBuffer> s = src.buffer();
+    id<MTLBuffer> d = dst.buffer();
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+        [blit copyFromBuffer:s sourceOffset:0 toBuffer:d destinationOffset:0 size:bytes];
+        [blit endEncoding];
+    });
 }
