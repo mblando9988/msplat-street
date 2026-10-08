@@ -37,10 +37,14 @@ static float halfToFloat(uint16_t h) {
     return f;
 }
 
-NpyArray readNpy(const std::string &path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) throw std::runtime_error("Cannot open .npy file: " + path);
+struct NpyHeader {
+    std::string descr;
+    bool fortran = false;
+    std::vector<int64_t> shape;
+    int64_t count = 1;
+};
 
+static NpyHeader readNpyHeader(std::ifstream &f, const std::string &path) {
     char magic[6];
     f.read(magic, 6);
     if (!f || memcmp(magic, "\x93NUMPY", 6) != 0) throw std::runtime_error("Not a .npy file: " + path);
@@ -65,16 +69,15 @@ NpyArray readNpy(const std::string &path) {
         return header.substr(colon + 1);
     };
 
+    NpyHeader h;
     std::string descrField = field("descr");
     size_t q0 = descrField.find('\''), q1 = descrField.find('\'', q0 + 1);
-    std::string descr = descrField.substr(q0 + 1, q1 - q0 - 1);
-    bool fortran = field("fortran_order").find("True") < field("fortran_order").find(',');
+    h.descr = descrField.substr(q0 + 1, q1 - q0 - 1);
+    h.fortran = field("fortran_order").find("True") < field("fortran_order").find(',');
 
     std::string shapeField = field("shape");
     size_t p0 = shapeField.find('('), p1 = shapeField.find(')');
     std::string dims = shapeField.substr(p0 + 1, p1 - p0 - 1);
-    NpyArray arr;
-    int64_t count = 1;
     size_t pos = 0;
     while (pos < dims.size()) {
         size_t comma = dims.find(',', pos);
@@ -82,12 +85,30 @@ NpyArray readNpy(const std::string &path) {
         tok.erase(std::remove_if(tok.begin(), tok.end(), ::isspace), tok.end());
         if (!tok.empty()) {
             int64_t d = std::stoll(tok);
-            arr.shape.push_back(d);
-            count *= d;
+            h.shape.push_back(d);
+            h.count *= d;
         }
         if (comma == std::string::npos) break;
         pos = comma + 1;
     }
+    return h;
+}
+
+std::vector<int64_t> readNpyShape(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) throw std::runtime_error("Cannot open .npy file: " + path);
+    return readNpyHeader(f, path).shape;
+}
+
+NpyArray readNpy(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) throw std::runtime_error("Cannot open .npy file: " + path);
+    NpyHeader h = readNpyHeader(f, path);
+    const std::string &descr = h.descr;
+    const bool fortran = h.fortran;
+    const int64_t count = h.count;
+    NpyArray arr;
+    arr.shape = h.shape;
 
     // Endianness: '<' little, '|' not applicable, '=' native (little on Apple Silicon)
     char endian = descr.empty() ? '<' : descr[0];
@@ -177,9 +198,6 @@ int attachPriors(InputData &data, const std::string &priorDir) {
 
 // ── Camera::loadPriors ──────────────────────────────────────────────────────
 
-// Priors are sampled by normalized pixel position, so they need not match the image
-// resolution. Larger ones are downsampled to bound GPU memory per camera.
-static constexpr int kMaxPriorDim = 1024;
 
 void Camera::loadPriors(float depthScale, bool useMask) {
     if (priorAux.defined() || !hasPriorFiles()) return;

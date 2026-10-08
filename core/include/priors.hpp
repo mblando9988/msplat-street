@@ -25,6 +25,11 @@ struct NpyArray {
     std::vector<float> data;  // converted to float32, C order
 };
 NpyArray readNpy(const std::string &path);
+std::vector<int64_t> readNpyShape(const std::string &path);  // header only
+
+// Prior maps larger than this (either side) are downsampled on load: they are sampled
+// by normalized position, so their resolution need not match the image's.
+constexpr int kMaxPriorDim = 1024;
 
 // Fill in missing prior paths from a priors/ directory. An empty priorDir means
 // <dataset>/priors when that directory exists. Returns the number of cameras that

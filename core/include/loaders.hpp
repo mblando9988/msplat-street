@@ -21,16 +21,7 @@ Image imreadRGB(const std::string &path);       // returns float32 [0,1] directl
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
 RGBA8Image imreadRGBA8(const std::string &path);  // decoded into GPU-visible memory
-
-// Undistortion crop (Brown-Conrady model, alpha=0): the largest rectangle of the
-// undistorted image, at unchanged focal lengths, that has no invalid borders. The
-// principal point of the cropped image is (cx - x, cy - y).
-struct UndistortROI {
-    int x = 0, y = 0, width = 0, height = 0;
-};
-UndistortROI undistortROI(int w, int h,
-    float fx, float fy, float cx, float cy,
-    float k1, float k2, float p1, float p2, float k3);
+ImageFileInfo probeImage(const std::string &path);  // header only: size, orientation, EXIF size
 
 // Pose utilities
 void autoScaleAndCenter(InputData &data);

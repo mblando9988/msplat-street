@@ -143,6 +143,17 @@ class Dataset:
         """Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32."""
         ...
 
+    def sizing_report(
+        self, num_downscales: int = 0, resolution_schedule: int = 3000, iterations: int = 0
+    ) -> dict:
+        """Every image's sizes as loaded (file, metadata, downscale, undistortion crop, training size,
+        intrinsics; schedule sizes when iterations > 0) with sizing findings, as a dict."""
+        ...
+
+    def export_cameras(self, path: str, keep_crs: bool = False) -> None:
+        """Write cameras.json: every camera's pose, intrinsics and image size as trained."""
+        ...
+
 class GaussianTrainer:
     """3D Gaussian Splatting trainer. All computation runs on the Metal GPU."""
 
@@ -213,6 +224,14 @@ class GaussianTrainer:
         """
         ...
 
+    def sizing_report(self) -> dict:
+        """Dataset.sizing_report with this trainer's resolution schedule."""
+        ...
+
+    def resolution(self, cam_idx: int = 0, step: int = -1) -> tuple[int, int, int]:
+        """(width, height, factor) a training camera renders at at a step (default: the current one)."""
+        ...
+
     def prior_losses(self) -> dict[str, float]:
         """Mean prior losses of the last step: dict with depth, sky, fill. Syncs the GPU."""
         ...
@@ -246,6 +265,30 @@ class GaussianTrainer:
     def iteration(self) -> int:
         """Current training iteration."""
         ...
+
+def preflight(
+    path: str,
+    downscale_factor: float = 1.0,
+    num_downscales: int = 2,
+    resolution_schedule: int = 3000,
+    iterations: int = 30000,
+    eval_mode: bool = False,
+    test_every: int = 8,
+    prior_dir: str = "",
+    output: str = "",
+    colmap_image_path: str = "",
+    require_depth: bool = False,
+    require_sky_masks: bool = False,
+    require_masks: bool = False,
+    strict: bool = False,
+) -> dict:
+    """Check a dataset without loading it: paths, image headers, the sizing from file to training
+    resolution, schedule, priors, point cloud and output location. Returns the report dict."""
+    ...
+
+def format_report(report: dict, verbose: bool = False) -> str:
+    """Human-readable text for a preflight or sizing report."""
+    ...
 
 def sync() -> None:
     """Synchronize GPU (wait for all commands to complete)."""

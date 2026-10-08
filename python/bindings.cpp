@@ -9,6 +9,7 @@
 #include "input_data.hpp"
 #include "loaders.hpp"
 #include "msplat.hpp"
+#include "preflight.hpp"
 #include "priors.hpp"
 
 #include <filesystem>
@@ -90,6 +91,16 @@ struct TrainingStats {
     int splat_count;
     float ms_per_step;
 };
+
+// ── JSON reports ────────────────────────────────────────────────────────────
+
+static nb::object json_loads(const std::string &text) {
+    return nb::module_::import_("json").attr("loads")(text);
+}
+
+static std::string json_dumps(const nb::object &obj) {
+    return nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(obj));
+}
 
 // ── numpy conversion ────────────────────────────────────────────────────────
 
@@ -174,6 +185,19 @@ public:
             throw std::runtime_error("Camera index out of range");
         msplat_gpu_sync();  // loading finishes on the GPU
         return to_numpy_rgb(cams[index].getGPUImage(1));
+    }
+
+    // Sizes as loaded, file to training resolution (see preflight.hpp)
+    nb::object sizing_report(int num_downscales, int resolution_schedule, int iterations) const {
+        ScheduleOptions sched;
+        sched.numDownscales = num_downscales;
+        sched.resolutionSchedule = resolution_schedule;
+        sched.iterations = iterations;
+        return json_loads(sizingReport(train_cams, test_cams, sched));
+    }
+
+    void export_cameras(const std::string &path, bool keep_crs) const {
+        data.saveCameras(path, keep_crs);
     }
 
     // Get camera-to-world pose (4x4 row-major) as numpy array
@@ -388,6 +412,18 @@ public:
     void export_sky(const std::string &path) {
         model->saveSky(path);
     }
+
+    nb::object sizing_report() const {
+        return dataset_ptr->sizing_report(config.num_downscales, config.resolution_schedule, config.iterations);
+    }
+
+    // Training resolution of a camera at a step (default: the current step)
+    nb::tuple resolution(int cam_idx, int step) const {
+        auto &cams = dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size()) throw std::runtime_error("Camera index out of range");
+        int f = model->getDownscaleFactor(step < 0 ? current_step : step);
+        return nb::make_tuple(levelSize(cams[cam_idx].width, f), levelSize(cams[cam_idx].height, f), f);
+    }
 };
 
 // ── Module definition ───────────────────────────────────────────────────────
@@ -557,7 +593,13 @@ NB_MODULE(_core, m) {
         .def("image", &Dataset::image, "index"_a, "use_test"_a = false,
             "Loaded ground-truth image (after downscale and undistortion) as numpy (H, W, 3) float32.")
         .def("prior_counts", &Dataset::prior_counts,
-            "Number of training cameras with each kind of prior file attached.");
+            "Number of training cameras with each kind of prior file attached.")
+        .def("sizing_report", &Dataset::sizing_report,
+            "num_downscales"_a = 0, "resolution_schedule"_a = 3000, "iterations"_a = 0,
+            "Every image's sizes as loaded (file, metadata, downscale, undistortion crop, training size,\n"
+            "intrinsics; schedule sizes when iterations > 0) with sizing findings, as a dict.")
+        .def("export_cameras", &Dataset::export_cameras, "path"_a, "keep_crs"_a = false,
+            "Write cameras.json: every camera's pose, intrinsics and image size as trained.");
 
     // GaussianTrainer
     nb::class_<GaussianTrainer>(m, "GaussianTrainer",
@@ -601,6 +643,10 @@ NB_MODULE(_core, m) {
             "Mean prior losses of the last step: dict with depth, sky, fill. Syncs the GPU.")
         .def("export_sky", &GaussianTrainer::export_sky, "path"_a,
             "Save the learned sky as an equirect PNG (requires learn_sky=True).")
+        .def("sizing_report", &GaussianTrainer::sizing_report,
+            "Dataset.sizing_report with this trainer's resolution schedule.")
+        .def("resolution", &GaussianTrainer::resolution, "cam_idx"_a = 0, "step"_a = -1,
+            "(width, height, factor) a training camera renders at at a step (default: the current one).")
         .def_prop_ro("splat_count", &GaussianTrainer::splat_count,
             "Current number of active Gaussians.")
         .def_prop_ro("iteration", [](const GaussianTrainer &t) { return t.current_step; },
@@ -690,6 +736,41 @@ NB_MODULE(_core, m) {
         memcpy(t.data_ptr(), img.data(), t.nbytes());
         return to_numpy_rgba8(t);
     }, "img"_a, "Pack (H, W, 3) float32 into (H, W, 4) uint8 RGBA on the GPU.");
+
+    m.def("preflight", [](const std::string &path, float downscale_factor, int num_downscales,
+                          int resolution_schedule, int iterations, bool eval_mode, int test_every,
+                          const std::string &prior_dir, const std::string &output,
+                          const std::string &colmap_image_path, bool require_depth, bool require_sky_masks,
+                          bool require_masks, bool strict) {
+        PreflightOptions o;
+        o.downscaleFactor = downscale_factor;
+        o.numDownscales = num_downscales;
+        o.resolutionSchedule = resolution_schedule;
+        o.iterations = iterations;
+        o.evalMode = eval_mode;
+        o.testEvery = test_every;
+        o.priorDir = prior_dir;
+        o.output = output;
+        o.colmapImagePath = colmap_image_path;
+        o.requireDepth = require_depth;
+        o.requireSkyMasks = require_sky_masks;
+        o.requireMasks = require_masks;
+        o.strict = strict;
+        std::string report;
+        {
+            nb::gil_scoped_release release;
+            report = preflightDataset(path, o);
+        }
+        return json_loads(report);
+    }, "path"_a, "downscale_factor"_a = 1.0f, "num_downscales"_a = 2, "resolution_schedule"_a = 3000,
+       "iterations"_a = 30000, "eval_mode"_a = false, "test_every"_a = 8, "prior_dir"_a = "",
+       "output"_a = "", "colmap_image_path"_a = "", "require_depth"_a = false,
+       "require_sky_masks"_a = false, "require_masks"_a = false, "strict"_a = false,
+       "Check a dataset without loading it: paths, image headers, the sizing from file to training\n"
+       "resolution, schedule, priors, point cloud and output location. Returns the report dict.");
+    m.def("format_report", [](nb::object report, bool verbose) {
+        return formatReport(json_dumps(report), verbose);
+    }, "report"_a, "verbose"_a = false, "Human-readable text for a preflight or sizing report.");
 
     // Utility
     m.def("sync", &msplat_gpu_sync, "Synchronize GPU (wait for all commands to complete)");

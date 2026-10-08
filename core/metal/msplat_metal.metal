@@ -4851,8 +4851,10 @@ struct UndistortParams {
 };
 
 // Brown-Conrady undistortion of the crop [roi, roi + dst) of the undistorted image
-// (same focal lengths): forward-distort each output pixel and bilinearly sample the
-// source, clamped to its border. The crop comes from undistortROI on the host.
+// (same focal lengths): forward-distort each output pixel's center and bilinearly
+// sample the source, clamped to its border. The principal point is in pixel-edge
+// coordinates like everywhere else (pixel j's center at j + 0.5). The crop comes from
+// undistortROI on the host.
 kernel void image_undistort_kernel(
     device const float* src             [[buffer(0)]],  // (src_h, src_w, 3)
     constant UndistortParams& p         [[buffer(1)]],
@@ -4860,13 +4862,14 @@ kernel void image_undistort_kernel(
     uint2 gid [[thread_position_in_grid]]
 ) {
     if (gid.x >= p.dst_w || gid.y >= p.dst_h) return;
-    float x = ((float)(gid.x + p.roi_x) - p.cx) / p.fx;
-    float y = ((float)(gid.y + p.roi_y) - p.cy) / p.fy;
+    float x = ((float)(gid.x + p.roi_x) + 0.5f - p.cx) / p.fx;
+    float y = ((float)(gid.y + p.roi_y) + 0.5f - p.cy) / p.fy;
     float r2 = x * x + y * y;
     float radial = 1.f + p.k1 * r2 + p.k2 * r2 * r2 + p.k3 * r2 * r2 * r2;
     float xd = x * radial + 2.f * p.p1 * x * y + p.p2 * (r2 + 2.f * x * x);
     float yd = y * radial + p.p1 * (r2 + 2.f * y * y) + 2.f * p.p2 * x * y;
-    float sx = xd * p.fx + p.cx, sy = yd * p.fy + p.cy;
+    // source position in pixel-center coordinates, as the bilinear taps index it
+    float sx = xd * p.fx + p.cx - 0.5f, sy = yd * p.fy + p.cy - 0.5f;
 
     int x0 = (int)floor(sx), y0 = (int)floor(sy);
     float fx = sx - floor(sx), fy = sy - floor(sy);

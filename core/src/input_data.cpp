@@ -24,50 +24,31 @@ void Camera::loadImage(float downscaleFactor) {
 }
 
 void Camera::setImage(const RGBA8Image &decoded, float downscaleFactor) {
-    const int rawW = decoded.width, rawH = decoded.height;
+    if (image.defined())
+        throw std::logic_error("Image already loaded (intrinsics were adapted to it): " + filePath);
+    ImageSizing s = planImageSizing(*this, decoded.width, decoded.height, downscaleFactor);
+    s.orientation = decoded.info.orientation;
+    s.exifWidth = decoded.info.exifWidth;
+    s.exifHeight = decoded.info.exifHeight;
 
-    // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (rawW != width || rawH != height)) {
-        float sx = (float)rawW / (float)width;
-        float sy = (float)rawH / (float)height;
-        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = rawW; height = rawH;
-    } else if (width == 0 || height == 0) {
-        width = rawW; height = rawH;
-    }
+    // RGBA8 → float RGB, area-resampled to the downscaled size in the same pass
+    MTensor level = gpu_empty({s.scaledHeight, s.scaledWidth, 3}, DType::Float32);
+    msplat_resize_area(decoded.rgba, true, s.fileWidth, s.fileHeight, level, s.scaledWidth, s.scaledHeight);
 
-    // Downscale
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(width / downscaleFactor);
-        int newH = (int)(height / downscaleFactor);
-        float s = 1.0f / downscaleFactor;
-        fx *= s; fy *= s; cx *= s; cy *= s;
-        width = newW; height = newH;
-    }
-    if (width < 1 || height < 1)
-        throw std::runtime_error("Downscale factor " + std::to_string(downscaleFactor) +
-                                 " leaves no pixels of " + filePath);
-
-    // RGBA8 → float RGB, area-resampled to the working size in the same pass
-    MTensor level = gpu_empty({height, width, 3}, DType::Float32);
-    msplat_resize_area(decoded.rgba, true, rawW, rawH, level, width, height);
-
-    // Undistort if needed
-    if (hasDistortion()) {
-        // Undistortion crops and remaps the image, which would misalign every prior pixel.
-        if (hasPriorFiles())
-            throw std::runtime_error("Priors need undistorted images, but " + filePath +
-                " has lens distortion. Undistort the dataset first (e.g. colmap image_undistorter).");
-        UndistortROI roi = undistortROI(width, height, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-        MTensor undist = gpu_empty({roi.height, roi.width, 3}, DType::Float32);
-        const float intr[4] = {fx, fy, cx, cy}, dist[5] = {k1, k2, p1, p2, k3};
-        msplat_undistort(level, width, height, intr, dist, roi.x, roi.y, undist, roi.width, roi.height);
+    if (s.undistorted) {
+        MTensor undist = gpu_empty({s.height, s.width, 3}, DType::Float32);
+        // intrinsics of the downscaled image, before the crop
+        const float intr[4] = {s.fx, s.fy, s.cx + (float)s.cropX, s.cy + (float)s.cropY};
+        const float dist[5] = {k1, k2, p1, p2, k3};
+        msplat_undistort(level, s.scaledWidth, s.scaledHeight, intr, dist, s.cropX, s.cropY,
+                         undist, s.width, s.height);
         level = std::move(undist);
-        cx -= roi.x; cy -= roi.y;
-        width = roi.width; height = roi.height;
         k1 = k2 = k3 = p1 = p2 = 0;
     }
 
+    width = s.width; height = s.height;
+    fx = s.fx; fy = s.fy; cx = s.cx; cy = s.cy;
+    sizing = s;
     image = std::move(level);
     imagePyramid.clear();
 }
@@ -80,8 +61,8 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
     if (it != imagePyramid.end()) return it->second;
 
     int w = (int)image.size(1), h = (int)image.size(0);
-    int newW = w / downscaleFactor;
-    int newH = h / downscaleFactor;
+    int newW = levelSize(w, downscaleFactor);
+    int newH = levelSize(h, downscaleFactor);
     MTensor scaled = gpu_empty({newH, newW, 3}, DType::Float32);
     msplat_resize_area(image, false, w, h, scaled, newW, newH);
     return imagePyramid.emplace(downscaleFactor, std::move(scaled)).first->second;
@@ -282,21 +263,22 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
 
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
-static InputData loadByFormat(const std::string &path, const std::string &colmapImagePath) {
+std::string detectDatasetFormat(const std::string &path) {
     fs::path root(path);
-
     // Nerfstudio: transforms.json
-    if (fs::exists(root / "transforms.json"))
-        return loaders::loadNerfstudio(path);
-
+    if (fs::exists(root / "transforms.json")) return "nerfstudio";
     // COLMAP: cameras.bin (direct or in sparse/0/)
-    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin"))
-        return loaders::loadColmap(path, colmapImagePath);
-
+    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin")) return "colmap";
     // Polycam: keyframes/ directory or cameras.json
-    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
-        return loaders::loadPolycam(path);
+    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json")) return "polycam";
+    return "";
+}
 
+static InputData loadByFormat(const std::string &path, const std::string &colmapImagePath) {
+    std::string format = detectDatasetFormat(path);
+    if (format == "nerfstudio") return loaders::loadNerfstudio(path);
+    if (format == "colmap") return loaders::loadColmap(path, colmapImagePath);
+    if (format == "polycam") return loaders::loadPolycam(path);
     throw std::runtime_error("Unrecognized dataset format in: " + path +
         "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
 }

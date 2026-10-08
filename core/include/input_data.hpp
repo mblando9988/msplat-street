@@ -6,6 +6,7 @@
 #include <tuple>
 #include <unordered_map>
 #include "metal_tensor.hpp"
+#include "image_sizing.hpp"
 
 // Simple float32 RGB image — replaces cv::Mat
 struct Image {
@@ -17,10 +18,18 @@ struct Image {
     const float* ptr() const { return data.data(); }
 };
 
+// Image header facts, read without decoding pixels
+struct ImageFileInfo {
+    int width = 0, height = 0;          // pixels as stored
+    int orientation = 1;                // EXIF orientation tag (1 = upright)
+    int exifWidth = 0, exifHeight = 0;  // EXIF PixelX/YDimension, 0 when absent
+};
+
 // Image decoded into GPU-visible memory: (height, width, 4) RGBA8, alpha unused
 struct RGBA8Image {
     MTensor rgba;
     int width = 0, height = 0;
+    ImageFileInfo info;
 };
 
 struct Camera {
@@ -36,6 +45,9 @@ struct Camera {
     // the buffers.
     MTensor image;
     std::unordered_map<int, MTensor> imagePyramid;
+    // How the image was sized on load, from file to training resolution (set by
+    // setImage; sizing.width == 0 until then). width/height/fx..cy equal its final values.
+    ImageSizing sizing;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
@@ -55,8 +67,9 @@ struct Camera {
     // Decode, downscale and undistort the image (updating the intrinsics to match).
     // loadCameraImages() does this for many cameras with parallel decoding.
     void loadImage(float downscaleFactor);
-    // Finish loading from an already decoded image: conversion, resampling and
-    // undistortion are encoded on the GPU; the decoded buffer can be dropped after.
+    // Finish loading from an already decoded image, executing planImageSizing():
+    // conversion, resampling and undistortion are encoded on the GPU and the intrinsics
+    // are updated to match; the decoded buffer can be dropped after. Once per camera.
     void setImage(const RGBA8Image &decoded, float downscaleFactor);
     bool hasImage() const { return image.defined(); }
     MTensor& getGPUImage(int downscaleFactor);
@@ -95,5 +108,7 @@ struct InputData {
 
 // Auto-detect format and load dataset
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "");
+// "nerfstudio", "colmap", "polycam", or "" when no supported camera poses are found
+std::string detectDatasetFormat(const std::string &path);
 
 #endif

@@ -193,8 +193,7 @@ void Model::ensureCapacity(int needed){
 }
 
 int Model::getDownscaleFactor(int step) {
-    int remaining = numDownscales - step / resolutionSchedule;
-    return 1 << std::max(remaining, 0);
+    return scheduleDownscaleFactor(step, numDownscales, resolutionSchedule);
 }
 
 void Model::afterTrain(int step){
@@ -497,12 +496,16 @@ int Model::loadCheckpoint(const std::string &filename) {
 }
 
 Model::CamSetup Model::prepareCam(Camera& cam, int step) {
-    const float sf = getDownscaleFactor(step);
+    const int sf = getDownscaleFactor(step);
     CamSetup s;
-    s.fx = cam.fx / sf; s.fy = cam.fy / sf;
-    s.cx = cam.cx / sf; s.cy = cam.cy / sf;
-    s.height = static_cast<int>(cam.height / sf);
-    s.width = static_cast<int>(cam.width / sf);
+    // Same whole-pixel size as the ground-truth pyramid level (getGPUImage); the
+    // intrinsics follow the actual per-axis ratio, not 1/sf, so odd sizes stay aligned
+    s.width = levelSize(cam.width, sf);
+    s.height = levelSize(cam.height, sf);
+    const float rx = cam.width > 0 ? (float)s.width / (float)cam.width : 1.f / (float)sf;
+    const float ry = cam.height > 0 ? (float)s.height / (float)cam.height : 1.f / (float)sf;
+    s.fx = cam.fx * rx; s.cx = cam.cx * rx;
+    s.fy = cam.fy * ry; s.cy = cam.cy * ry;
 
     float fovX = 2.0f * std::atan(s.width / (2.0f * s.fx));
     float fovY = 2.0f * std::atan(s.height / (2.0f * s.fy));

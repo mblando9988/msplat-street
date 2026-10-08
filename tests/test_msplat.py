@@ -503,15 +503,16 @@ def test_gpu_resize_area_matches_numpy(src, dst):
 
 
 def _undistort_ref(img, k, d, rx, ry, out_w, out_h):
-    """Forward-distort each output pixel of the crop, bilinear sample clamped to the border."""
+    """Forward-distort each output pixel center of the crop, bilinear sample clamped to the
+    border. Principal point in pixel-edge coordinates (pixel j's center at j + 0.5)."""
     fx, fy, cx, cy = k
     k1, k2, p1, p2, k3 = d
     ys, xs = np.mgrid[0:out_h, 0:out_w].astype(np.float64)
-    x, y = (xs + rx - cx) / fx, (ys + ry - cy) / fy
+    x, y = (xs + rx + 0.5 - cx) / fx, (ys + ry + 0.5 - cy) / fy
     r2 = x * x + y * y
     radial = 1 + k1 * r2 + k2 * r2 ** 2 + k3 * r2 ** 3
-    sx = (x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)) * fx + cx
-    sy = (y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y) * fy + cy
+    sx = (x * radial + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)) * fx + cx - 0.5
+    sy = (y * radial + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y) * fy + cy - 0.5
     x0, y0 = np.floor(sx).astype(int), np.floor(sy).astype(int)
     ax, ay = (sx - x0)[..., None], (sy - y0)[..., None]
     h, w = img.shape[:2]
@@ -618,7 +619,7 @@ def _write_png_rgb(path, img):
 
 def _make_synthetic_dataset(root, n=4, w=67, h=45, meta=None, intrinsics=None, distortion=None):
     """Nerfstudio dataset of n random RGB PNGs (w x h). meta: (w, h) the cameras claim
-    (default: the file size); intrinsics: (fx, fy, cx, cy) at the meta size."""
+    (default: the file size; False: no w/h keys); intrinsics: (fx, fy, cx, cy) at that size."""
     import json
 
     os.makedirs(os.path.join(root, "images"), exist_ok=True)
@@ -633,7 +634,9 @@ def _make_synthetic_dataset(root, n=4, w=67, h=45, meta=None, intrinsics=None, d
         c2w = np.eye(4)
         c2w[:3, 3] = [0.1 * i, 0.0, 0.0]
         frames.append({"file_path": f"images/img_{i:02d}.png", "transform_matrix": c2w.tolist()})
-    meta_json = {"w": mw, "h": mh, "fl_x": fx, "fl_y": fy, "cx": cx, "cy": cy, "frames": frames}
+    meta_json = {"fl_x": fx, "fl_y": fy, "cx": cx, "cy": cy, "frames": frames}
+    if meta is not False:
+        meta_json.update({"w": mw, "h": mh})
     if distortion:
         meta_json.update(dict(zip(["k1", "k2", "p1", "p2", "k3"], distortion)))
     with open(os.path.join(root, "transforms.json"), "w") as f:
@@ -660,3 +663,82 @@ def test_dataset_images_load_on_gpu(tmp_path):
         b = half.image(i)
         assert b.shape == (22, 33, 3)
         np.testing.assert_allclose(b, _area_resize(a, 33, 22), atol=1e-5)
+
+
+# ── Sizing reports and preflight (no dataset needed) ────────────────────────
+
+
+def _write_points_ply(path, n=20):
+    pts = np.random.default_rng(0).normal(0, 1, (n, 3))
+    with open(path, "w") as f:
+        f.write(f"ply\nformat ascii 1.0\nelement vertex {n}\nproperty float x\nproperty float y\n"
+                "property float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n")
+        for p in pts:
+            f.write(f"{p[0]} {p[1]} {p[2]} 128 128 128\n")
+
+
+def _issue_codes(report):
+    return {i["code"] for i in report["issues"]}
+
+
+def test_preflight_states_every_size(tmp_path):
+    """Files at 1/4 of the calibration size, then a /3 downscale: every stage is reported."""
+    from msplat import _core
+
+    _make_synthetic_dataset(str(tmp_path), n=3, w=301, h=226, meta=(1204, 904))
+    _write_points_ply(os.path.join(tmp_path, "points3D.ply"))
+    r = _core.preflight(str(tmp_path), downscale_factor=3.0, num_downscales=1, resolution_schedule=100,
+                        iterations=150, output=str(tmp_path / "out" / "splat.ply"))
+    assert r["ok"], _core.format_report(r)
+    assert {"META_SIZE_MISMATCH", "DOWNSCALE_ROUNDED", "OUTPUT_DIR_CREATED"} <= _issue_codes(r)
+    (g,) = r["sizes"]["groups"]
+    assert g["file_size"] == [301, 226] and g["metadata_size"] == [1204, 904]
+    assert g["intrinsics_rescale"] == pytest.approx([0.25, 0.25])
+    assert g["train_size"] == [100, 75]           # int(301 / 3), int(226 / 3)
+    assert g["schedule_sizes"] == [[50, 37], [100, 75]]
+    assert r["schedule"]["levels"] == [{"factor": 2, "steps": [1, 99]}, {"factor": 1, "steps": [100, 150]}]
+    k = r["images"][0]["intrinsics"]
+    # 0.8 * 1204 * 0.25 = fx at file size; then the exact 100/301 ratio, not 1/3
+    assert k["fx"] == pytest.approx(0.8 * 1204 * 0.25 * 100 / 301, rel=1e-5)
+    assert k["cy"] == pytest.approx(904 / 2 * 0.25 * 75 / 226, rel=1e-5)
+    text = _core.format_report(r)
+    assert "301x226 file" in text and "trains at 100x75" in text
+
+
+def test_preflight_flags_wrong_intrinsics_and_missing_points(tmp_path):
+    from msplat import _core
+
+    # No w/h in transforms.json and intrinsics for a 4x larger image
+    _make_synthetic_dataset(str(tmp_path), n=2, w=120, h=90, meta=False, intrinsics=(384, 384, 240, 180))
+    r = _core.preflight(str(tmp_path))
+    assert not r["ok"]
+    assert {"PRINCIPAL_POINT_OUTSIDE", "NO_POINTS"} <= _issue_codes(r)
+    pp = next(i for i in r["issues"] if i["code"] == "PRINCIPAL_POINT_OUTSIDE")
+    assert "4.00x larger" in pp["message"] and pp["count"] == 2
+
+
+def test_preflight_without_poses_or_dataset(tmp_path):
+    from msplat import _core
+
+    os.makedirs(tmp_path / "images")
+    _write_png_rgb(str(tmp_path / "images" / "a.png"), np.zeros((8, 8, 3), np.uint8))
+    assert _issue_codes(_core.preflight(str(tmp_path))) == {"NO_POSES"}
+    assert _issue_codes(_core.preflight(str(tmp_path / "missing"))) == {"DATASET_NOT_FOUND"}
+
+
+def test_loaded_sizes_match_preflight(tmp_path):
+    """The sizes the loader produces are the sizes the preflight planned."""
+    from msplat import _core, Dataset
+
+    _make_synthetic_dataset(str(tmp_path), n=3, w=251, h=187, meta=(502, 374))
+    plan = _core.preflight(str(tmp_path), downscale_factor=2.5, num_downscales=2, resolution_schedule=10,
+                           iterations=40)
+    ds = Dataset(str(tmp_path), downscale_factor=2.5)
+    loaded = ds.sizing_report(num_downscales=2, resolution_schedule=10, iterations=40)
+    keys = ["file_size", "metadata_size", "downscaled_size", "train_size", "intrinsics", "schedule_sizes"]
+    assert len(plan["images"]) == len(loaded["images"]) == 3
+    for i, (a, b) in enumerate(zip(plan["images"], loaded["images"])):
+        assert a["name"] == b["name"]
+        for k in keys:
+            assert a[k] == b[k], k
+        assert ds.image(i).shape == (b["train_size"][1], b["train_size"][0], 3)
