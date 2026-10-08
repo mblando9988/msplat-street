@@ -11,6 +11,7 @@ def main():
         sys.exit(1)
 
     from dataclasses import dataclass, field
+    from typing import Literal, Optional
 
     @dataclass
     class Args:
@@ -76,9 +77,52 @@ def main():
         test_every: int = 8
         """Hold out every Nth image for eval"""
 
+        preset: Optional[Literal["street"]] = None
+        """'street': prior-guided settings for street-view / sparse forward captures (needs msplat-prior output)"""
+
+        prior_dir: str = ""
+        """Prior directory (default: <input>/priors)"""
+
+        depth_weight: Optional[float] = None
+        """Depth prior loss weight (0 = off)"""
+
+        depth_weight_final: Optional[float] = None
+        """Depth prior weight at the last step (<0: constant)"""
+
+        sky_alpha_weight: Optional[float] = None
+        """Push sky-mask pixels transparent"""
+
+        fill_weight: Optional[float] = None
+        """Push non-sky pixels opaque (needs sky masks)"""
+
+        use_masks: Optional[bool] = None
+        """Ignore pixels where priors/mask is 0 (moving objects)"""
+
+        learn_sky: Optional[bool] = None
+        """Learn a direction-dependent sky behind the gaussians"""
+
+        exposure_compensation: Optional[bool] = None
+        """Per-image affine exposure compensation"""
+
+        max_scale_ratio: Optional[float] = None
+        """Cap largest/median gaussian scale (0 = off)"""
+
     args = tyro.cli(Args)
 
-    from msplat import TrainingConfig, Dataset, GaussianTrainer, sync, cleanup
+    from msplat import TrainingConfig, Dataset, GaussianTrainer, sync, cleanup, STREET_PRESET
+
+    # Preset first, then every prior option given explicitly on the command line
+    prior_kwargs = dict(STREET_PRESET) if args.preset == "street" else {}
+    sh_degree_given = any(a.startswith(("--sh-degree", "--sh_degree")) for a in sys.argv[1:])
+    if args.preset == "street" and not sh_degree_given:
+        args.sh_degree = prior_kwargs.pop("sh_degree")
+    else:
+        prior_kwargs.pop("sh_degree", None)
+    for name in ("depth_weight", "depth_weight_final", "sky_alpha_weight", "fill_weight",
+                 "use_masks", "learn_sky", "exposure_compensation", "max_scale_ratio"):
+        value = getattr(args, name)
+        if value is not None:
+            prior_kwargs[name] = value
 
     config = TrainingConfig(
         iterations=args.num_iters,
@@ -98,6 +142,7 @@ def main():
         downscale_factor=args.downscale_factor,
         output=args.output,
         save_every=args.save_every,
+        **prior_kwargs,
     )
 
     dataset = Dataset(
@@ -105,7 +150,10 @@ def main():
         downscale_factor=args.downscale_factor,
         eval_mode=args.eval,
         test_every=args.test_every,
+        prior_dir=args.prior_dir,
     )
+    if prior_kwargs:
+        print(f"Priors attached: {dataset.prior_counts()}")
     print(f"Loaded {dataset.num_train} train cameras", end="")
     if args.eval:
         print(f", {dataset.num_test} test cameras")
@@ -125,6 +173,10 @@ def main():
 
     trainer.export_ply(args.output)
     print(f"Saved {args.output}")
+    if config.learn_sky:
+        sky_path = args.output.rsplit(".", 1)[0] + "_sky.png"
+        trainer.export_sky(sky_path)
+        print(f"Saved {sky_path}")
 
     if args.eval:
         metrics = trainer.evaluate()

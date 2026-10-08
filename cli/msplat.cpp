@@ -11,6 +11,7 @@
 #include "input_data.hpp"
 #include "random_iter.hpp"
 #include "loaders.hpp"
+#include "priors.hpp"
 #include "msplat.hpp"
 #include "bindings.h"
 
@@ -93,7 +94,42 @@ int main(int argc, char *argv[]) {
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
+    // Prior-guided training (street view / sparse forward captures; see msplat-prior)
+    std::string preset;
+    app.add_option("--preset", preset, "Option preset: 'street' turns on the prior-guided terms below")
+        ->check(CLI::IsMember({"street"}));
+    std::string priorDir;
+    app.add_option("--prior-dir", priorDir, "Prior directory (default: <dataset>/priors)")
+        ->check(CLI::ExistingDirectory);
+    PriorOptions priorOpts;
+    app.add_option("--depth-weight", priorOpts.depthWeight, "Depth prior loss weight (0 = off)");
+    app.add_option("--depth-weight-final", priorOpts.depthWeightFinal, "Depth prior weight at the last step (<0: constant)");
+    app.add_option("--sky-alpha-weight", priorOpts.skyAlphaWeight, "Push sky-mask pixels transparent");
+    app.add_option("--fill-weight", priorOpts.fillWeight, "Push non-sky pixels opaque (needs sky masks)");
+    app.add_flag("--use-masks", priorOpts.useMasks, "Ignore pixels where priors/mask is 0 (moving objects)");
+    app.add_flag("--learn-sky", priorOpts.learnSky, "Learn a direction-dependent sky behind the gaussians");
+    std::vector<int> skyRes = {512, 128};
+    app.add_option("--sky-res", skyRes, "Sky texture width height")->expected(2);
+    app.add_flag("--exposure-comp", priorOpts.exposure, "Per-image affine exposure compensation");
+    app.add_option("--max-scale-ratio", priorOpts.maxScaleRatio, "Cap largest/median gaussian scale (0 = off)");
+
     CLI11_PARSE(app, argc, argv);
+
+    // The preset fills in every prior option the command line left unset.
+    if (preset == "street") {
+        auto unset = [&](const char *name) { return app.get_option(name)->count() == 0; };
+        if (unset("--depth-weight")) priorOpts.depthWeight = 0.2f;
+        if (unset("--depth-weight-final")) priorOpts.depthWeightFinal = 0.05f;
+        if (unset("--sky-alpha-weight")) priorOpts.skyAlphaWeight = 0.05f;
+        if (unset("--fill-weight")) priorOpts.fillWeight = 0.01f;
+        if (unset("--use-masks")) priorOpts.useMasks = true;
+        if (unset("--learn-sky")) priorOpts.learnSky = true;
+        if (unset("--exposure-comp")) priorOpts.exposure = true;
+        if (unset("--max-scale-ratio")) priorOpts.maxScaleRatio = 10.0f;
+        if (unset("--sh-degree")) shDegree = 1;
+    }
+    priorOpts.skyWidth = skyRes[0];
+    priorOpts.skyHeight = skyRes[1];
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -101,6 +137,7 @@ int main(int argc, char *argv[]) {
 
     try {
         InputData inputData = inputDataFromX(projectRoot, colmapImagePath);
+        if (!priorDir.empty()) attachPriors(inputData, priorDir);
 
         for (auto &cam : inputData.cameras)
             cam.loadImage(downScaleFactor);
@@ -124,6 +161,7 @@ int main(int argc, char *argv[]) {
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
                      bgColor.data());
+        model.configurePriors(priorOpts, cams);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -317,6 +355,11 @@ int main(int argc, char *argv[]) {
 
         inputData.saveCameras((fs::path(outputScene).parent_path() / "cameras.json").string(), keepCrs);
         model.save(outputScene, numIters);
+        if (priorOpts.learnSky) {
+            fs::path skyPath = fs::path(outputScene).replace_extension("").string() + "_sky.png";
+            model.saveSky(skyPath.string());
+            std::cout << "Saved learned sky: " << skyPath.string() << std::endl;
+        }
 
         // Evaluation
         if (evalMode && !testCams.empty()) {

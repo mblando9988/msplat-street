@@ -9,6 +9,7 @@
 #include "input_data.hpp"
 #include "msplat.hpp"
 #include "ssim.hpp"
+#include "priors.hpp"
 
 #include <filesystem>
 #include <chrono>
@@ -43,6 +44,43 @@ struct TrainingConfig {
     // Magenta default — high contrast against typical scenes, makes
     // under-reconstructed regions obvious during training.
     std::vector<float> bg_color = {0.6130f, 0.0101f, 0.3984f};
+
+    // Prior-guided training (msplat.street_config() sets these for street captures)
+    float depth_weight = 0.0f;
+    float depth_weight_final = -1.0f;
+    float depth_huber_delta = 0.05f;
+    float depth_min_alpha = 0.25f;
+    float sky_alpha_weight = 0.0f;
+    float fill_weight = 0.0f;
+    bool use_masks = false;
+    bool learn_sky = false;
+    int sky_width = 512;
+    int sky_height = 128;
+    float sky_lr = 0.01f;
+    bool exposure_compensation = false;
+    float exposure_lr = 5e-3f;
+    float exposure_reg = 1e-2f;
+    float max_scale_ratio = 0.0f;
+
+    PriorOptions prior_options() const {
+        PriorOptions o;
+        o.depthWeight = depth_weight;
+        o.depthWeightFinal = depth_weight_final;
+        o.depthHuberDelta = depth_huber_delta;
+        o.depthMinAlpha = depth_min_alpha;
+        o.skyAlphaWeight = sky_alpha_weight;
+        o.fillWeight = fill_weight;
+        o.useMasks = use_masks;
+        o.learnSky = learn_sky;
+        o.skyWidth = sky_width;
+        o.skyHeight = sky_height;
+        o.skyLr = sky_lr;
+        o.exposure = exposure_compensation;
+        o.exposureLr = exposure_lr;
+        o.exposureReg = exposure_reg;
+        o.maxScaleRatio = max_scale_ratio;
+        return o;
+    }
 };
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
@@ -62,9 +100,10 @@ public:
     std::vector<Camera> test_cams;
 
     Dataset(const std::string &path, float downscale_factor,
-            bool eval_mode, int test_every)
+            bool eval_mode, int test_every, const std::string &prior_dir)
     {
         data = inputDataFromX(path);
+        if (!prior_dir.empty()) attachPriors(data, prior_dir);
 
         // Load images (parallel)
         for (auto &cam : data.cameras) {
@@ -83,6 +122,21 @@ public:
 
     size_t num_train() const { return train_cams.size(); }
     size_t num_test() const { return test_cams.size(); }
+
+    // Train cameras with prior files attached, by kind
+    nb::dict prior_counts() const {
+        int any = 0, depth = 0, conf = 0, sky = 0, mask = 0;
+        for (auto &c : train_cams) {
+            any += c.hasPriorFiles();
+            depth += !c.priorDepthPath.empty();
+            conf += !c.priorConfidencePath.empty();
+            sky += !c.priorSkyPath.empty();
+            mask += !c.priorMaskPath.empty();
+        }
+        nb::dict d;
+        d["any"] = any; d["depth"] = depth; d["confidence"] = conf; d["sky"] = sky; d["mask"] = mask;
+        return d;
+    }
 
     // Get camera-to-world pose (4x4 row-major) as numpy array
     nb::object camera_pose(int index) {
@@ -124,6 +178,7 @@ public:
             cfg.iterations, cfg.keep_crs,
             cfg.bg_color.data()
         );
+        model->configurePriors(cfg.prior_options(), dataset.train_cams);
 
         cam_indices.resize(dataset.train_cams.size());
         std::iota(cam_indices.begin(), cam_indices.end(), 0);
@@ -277,6 +332,39 @@ public:
     int splat_count() const {
         return model->means.size(0);
     }
+
+    // Expected depth (dataset units, 0 where empty) and accumulated alpha → numpy (H, W) each
+    nb::tuple render_depth(int cam_idx, bool use_test) {
+        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
+        if (cam_idx < 0 || cam_idx >= (int)cams.size())
+            throw std::runtime_error("Camera index out of range");
+        MTensor depth, alpha;
+        model->renderDepth(cams[cam_idx], current_step, depth, alpha);
+        return nb::make_tuple(to_numpy_2d(depth), to_numpy_2d(alpha));
+    }
+
+    nb::dict prior_losses() {
+        float l[3];
+        model->lastPriorLosses(l);
+        nb::dict d;
+        d["depth"] = l[0];
+        d["sky"] = l[1];
+        d["fill"] = l[2];
+        return d;
+    }
+
+    void export_sky(const std::string &path) {
+        model->saveSky(path);
+    }
+
+    static nb::object to_numpy_2d(const MTensor &t) {
+        size_t h = (size_t)t.size(0), w = (size_t)t.size(1);
+        float *buf = new float[h * w];
+        memcpy(buf, t.data_ptr(), h * w * sizeof(float));
+        nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
+        size_t shape[2] = {h, w};
+        return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
+    }
 };
 
 // ── Module definition ───────────────────────────────────────────────────────
@@ -295,7 +383,13 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color) {
+                std::vector<float> bg_color,
+                float depth_weight, float depth_weight_final,
+                float depth_huber_delta, float depth_min_alpha,
+                float sky_alpha_weight, float fill_weight, bool use_masks,
+                bool learn_sky, int sky_width, int sky_height, float sky_lr,
+                bool exposure_compensation, float exposure_lr, float exposure_reg,
+                float max_scale_ratio) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -317,6 +411,23 @@ NB_MODULE(_core, m) {
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
+            if (learn_sky && (sky_width < 4 || sky_height < 2))
+                throw std::invalid_argument("sky texture must be at least 4x2");
+            cfg->depth_weight = depth_weight;
+            cfg->depth_weight_final = depth_weight_final;
+            cfg->depth_huber_delta = depth_huber_delta;
+            cfg->depth_min_alpha = depth_min_alpha;
+            cfg->sky_alpha_weight = sky_alpha_weight;
+            cfg->fill_weight = fill_weight;
+            cfg->use_masks = use_masks;
+            cfg->learn_sky = learn_sky;
+            cfg->sky_width = sky_width;
+            cfg->sky_height = sky_height;
+            cfg->sky_lr = sky_lr;
+            cfg->exposure_compensation = exposure_compensation;
+            cfg->exposure_lr = exposure_lr;
+            cfg->exposure_reg = exposure_reg;
+            cfg->max_scale_ratio = max_scale_ratio;
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -335,7 +446,22 @@ NB_MODULE(_core, m) {
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
-            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f})
+            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
+            "depth_weight"_a = 0.0f,
+            "depth_weight_final"_a = -1.0f,
+            "depth_huber_delta"_a = 0.05f,
+            "depth_min_alpha"_a = 0.25f,
+            "sky_alpha_weight"_a = 0.0f,
+            "fill_weight"_a = 0.0f,
+            "use_masks"_a = false,
+            "learn_sky"_a = false,
+            "sky_width"_a = 512,
+            "sky_height"_a = 128,
+            "sky_lr"_a = 0.01f,
+            "exposure_compensation"_a = false,
+            "exposure_lr"_a = 5e-3f,
+            "exposure_reg"_a = 1e-2f,
+            "max_scale_ratio"_a = 0.0f)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -354,7 +480,32 @@ NB_MODULE(_core, m) {
         .def_rw("output", &TrainingConfig::output)
         .def_rw("save_every", &TrainingConfig::save_every)
         .def_rw("bg_color", &TrainingConfig::bg_color,
-            "Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398].");
+            "Background color as [R, G, B] floats in [0, 1]. Default magenta [0.613, 0.010, 0.398].")
+        .def_rw("depth_weight", &TrainingConfig::depth_weight,
+            "Weight of the log-depth prior loss (0 = off). Needs priors/depth.")
+        .def_rw("depth_weight_final", &TrainingConfig::depth_weight_final,
+            "Depth prior weight at the last step, log-linear schedule (<0: constant, 0: linear to 0).")
+        .def_rw("depth_huber_delta", &TrainingConfig::depth_huber_delta,
+            "Huber transition of the depth loss, in log depth (~ relative error).")
+        .def_rw("depth_min_alpha", &TrainingConfig::depth_min_alpha,
+            "Depth is only supervised where accumulated alpha exceeds this.")
+        .def_rw("sky_alpha_weight", &TrainingConfig::sky_alpha_weight,
+            "Push sky-mask pixels transparent so the learned sky shows. Needs priors/sky.")
+        .def_rw("fill_weight", &TrainingConfig::fill_weight,
+            "Push non-sky pixels opaque (cameras with a sky mask).")
+        .def_rw("use_masks", &TrainingConfig::use_masks,
+            "Drop all gradients where priors/mask is 0 (moving objects).")
+        .def_rw("learn_sky", &TrainingConfig::learn_sky,
+            "Learn a direction-dependent sky (equirect texture) behind the gaussians.")
+        .def_rw("sky_width", &TrainingConfig::sky_width)
+        .def_rw("sky_height", &TrainingConfig::sky_height)
+        .def_rw("sky_lr", &TrainingConfig::sky_lr)
+        .def_rw("exposure_compensation", &TrainingConfig::exposure_compensation,
+            "Per-image affine color transform, absorbing auto-exposure/white balance.")
+        .def_rw("exposure_lr", &TrainingConfig::exposure_lr)
+        .def_rw("exposure_reg", &TrainingConfig::exposure_reg)
+        .def_rw("max_scale_ratio", &TrainingConfig::max_scale_ratio,
+            "Cap each gaussian's largest/median scale ratio (needle suppression; <=1 = off).");
 
     // TrainingStats
     nb::class_<TrainingStats>(m, "TrainingStats",
@@ -371,13 +522,17 @@ NB_MODULE(_core, m) {
     // Dataset
     nb::class_<Dataset>(m, "Dataset",
             "A loaded dataset of camera images. Auto-detects COLMAP, Nerfstudio, and Polycam formats.")
-        .def(nb::init<const std::string &, float, bool, int>(),
+        .def(nb::init<const std::string &, float, bool, int, const std::string &>(),
             "path"_a, "downscale_factor"_a = 1.0f,
-            "eval_mode"_a = false, "test_every"_a = 8)
+            "eval_mode"_a = false, "test_every"_a = 8, "prior_dir"_a = "",
+            "prior_dir: directory of geometric priors (depth/, confidence/, sky/, mask/).\n"
+            "Defaults to <path>/priors when present; transforms.json frame keys take precedence.")
         .def_prop_ro("num_train", &Dataset::num_train, "Number of training cameras.")
         .def_prop_ro("num_test", &Dataset::num_test, "Number of test cameras (0 unless eval_mode=True).")
         .def("camera_pose", &Dataset::camera_pose, "index"_a,
-            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.");
+            "Get camera-to-world pose (4x4 row-major, OpenGL convention) as numpy array.")
+        .def("prior_counts", &Dataset::prior_counts,
+            "Number of training cameras with each kind of prior file attached.");
 
     // GaussianTrainer
     nb::class_<GaussianTrainer>(m, "GaussianTrainer",
@@ -407,6 +562,14 @@ NB_MODULE(_core, m) {
             "Save a training checkpoint.")
         .def("load_checkpoint", &GaussianTrainer::load_checkpoint, "path"_a,
             "Load a training checkpoint and resume from the saved iteration.")
+        .def("render_depth", &GaussianTrainer::render_depth,
+            "cam_idx"_a, "use_test"_a = false,
+            "Render expected depth (dataset units, 0 where empty) and accumulated alpha.\n"
+            "Returns a tuple of two numpy (H, W) float32 arrays.")
+        .def("prior_losses", &GaussianTrainer::prior_losses,
+            "Mean prior losses of the last step: dict with depth, sky, fill. Syncs the GPU.")
+        .def("export_sky", &GaussianTrainer::export_sky, "path"_a,
+            "Save the learned sky as an equirect PNG (requires learn_sky=True).")
         .def_prop_ro("splat_count", &GaussianTrainer::splat_count,
             "Current number of active Gaussians.")
         .def_prop_ro("iteration", [](const GaussianTrainer &t) { return t.current_step; },

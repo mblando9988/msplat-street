@@ -31,10 +31,30 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    // Optional geometric priors (see priors.hpp). Paths come from transforms.json
+    // keys or attachPriors(); imageName is the image path relative to the image root.
+    std::string imageName;
+    std::string priorDepthPath, priorConfidencePath, priorSkyPath, priorMaskPath;
+    int trainIndex = -1;  // slot for per-image parameters, set by Model::configurePriors
+
+    // Native-resolution prior buffers, uploaded by loadPriors()
+    MTensor priorDepth;   // (priorH, priorW) float, normalized scene units, 0 = invalid
+    MTensor priorAux;     // (priorH, priorW, 4) uint8: confidence, sky, keep, 0
+    int priorW = 0, priorH = 0;
+    bool priorHasDepth = false, priorHasSky = false, priorHasMask = false;
+
     void loadImage(float downscaleFactor);
     Image getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
+    bool hasPriorFiles() const {
+        return !priorDepthPath.empty() || !priorSkyPath.empty() || !priorMaskPath.empty();
+    }
+    bool hasPriors() const { return priorAux.defined(); }
+    // Read the prior files and upload them. depthScale converts dataset units to the
+    // normalized scene (InputData::scale); useMask=false ignores the keep mask.
+    // Idempotent.
+    void loadPriors(float depthScale, bool useMask);
 };
 
 struct Points {
@@ -48,6 +68,7 @@ struct InputData {
     float scale = 1.0f;
     float translation[3] = {};
     Points points;
+    std::string rootDir;  // dataset directory passed to inputDataFromX
 
     std::tuple<std::vector<Camera>, Camera*> getCameras(bool validate, const std::string &valImage = "random");
     std::tuple<std::vector<Camera>, std::vector<Camera>> splitTrainTest(int testEvery);

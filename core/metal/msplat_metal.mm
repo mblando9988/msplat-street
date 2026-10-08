@@ -158,6 +158,15 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // Prior-guided training
+    id<MTLComputePipelineState> rasterize_forward_aux_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_backward_aux_kernel_cpso;
+    id<MTLComputePipelineState> prior_loss_kernel_cpso;
+    id<MTLComputePipelineState> sky_backward_kernel_cpso;
+    id<MTLComputePipelineState> exposure_apply_kernel_cpso;
+    id<MTLComputePipelineState> exposure_backward_kernel_cpso;
+    id<MTLComputePipelineState> exposure_adam_kernel_cpso;
+    id<MTLComputePipelineState> scale_ratio_cap_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -261,6 +270,15 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    // Prior-guided training
+    ctx->rasterize_forward_aux_kernel_cpso        = load(@"rasterize_forward_aux_kernel");
+    ctx->rasterize_backward_aux_kernel_cpso       = load(@"rasterize_backward_aux_kernel");
+    ctx->prior_loss_kernel_cpso                   = load(@"prior_loss_kernel");
+    ctx->sky_backward_kernel_cpso                 = load(@"sky_backward_kernel");
+    ctx->exposure_apply_kernel_cpso               = load(@"exposure_apply_kernel");
+    ctx->exposure_backward_kernel_cpso            = load(@"exposure_backward_kernel");
+    ctx->exposure_adam_kernel_cpso                = load(@"exposure_adam_kernel");
+    ctx->scale_ratio_cap_kernel_cpso              = load(@"scale_ratio_cap_kernel");
 
     [metal_library release];
 
@@ -489,8 +507,79 @@ struct FusedTensorCache {
             v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
         }
     }
+
+    // Prior-guided training buffers, allocated on first use
+    int aux_h = 0, aux_w = 0;
+    MTensor out_depth, bg_img, v_aux;   // (H, W) sum w_i z_i, (H, W, 3) background, (H, W, 2) dL/dD, dL/dA
+    int expo_h = 0, expo_w = 0;
+    MTensor out_adj, v_adj;             // (H, W, 3) exposure-transformed render and its cotangent
+    // Bound in place of absent optional inputs: Metal needs a valid buffer at every
+    // index a kernel declares, even one it never reads.
+    MTensor dummy_tex, dummy_depth, dummy_aux, dummy_terms;
+
+    void ensure_aux(int ih, int iw, id<MTLDevice> dev) {
+        if (ih == aux_h && iw == aux_w && out_depth.defined()) return;
+        aux_h = ih; aux_w = iw;
+        out_depth = mtensor_empty(dev, {ih, iw}, DType::Float32);
+        bg_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        v_aux = mtensor_zeros(dev, {ih, iw, 2}, DType::Float32);
+    }
+
+    void ensure_exposure(int ih, int iw, id<MTLDevice> dev) {
+        if (ih == expo_h && iw == expo_w && out_adj.defined()) return;
+        expo_h = ih; expo_w = iw;
+        out_adj = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        v_adj = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+    }
+
+    void ensure_dummies(id<MTLDevice> dev) {
+        if (dummy_tex.defined()) return;
+        dummy_tex = mtensor_zeros(dev, {1, 1, 3}, DType::Float32);
+        dummy_depth = mtensor_zeros(dev, {1, 1}, DType::Float32);
+        dummy_aux = mtensor_zeros(dev, {1, 1, 4}, DType::UInt8);
+        dummy_aux.data<uint8_t>()[2] = 255;  // keep everything, no sky, zero confidence
+        dummy_terms = mtensor_zeros(dev, {4}, DType::Float32);
+    }
 };
 static FusedTensorCache g_tcache;
+
+// Must match SkyParams in msplat_metal.metal.
+struct PriorSkyParams {
+    float up[3], e1[3], e2[3];
+    float fx, fy, cx, cy;
+    uint32_t tex_w, tex_h, enabled, pad;
+};
+static_assert(sizeof(PriorSkyParams) == 68, "PriorSkyParams must match SkyParams");
+
+// Must match PriorLossParams in msplat_metal.metal.
+struct PriorLossParamsGPU {
+    uint32_t img_w, img_h, prior_w, prior_h;
+    float depth_weight, sky_weight, fill_weight, huber_delta, min_alpha, inv_npix;
+    uint32_t has_depth, has_sky_mask, mask_photo, pad0, pad1, pad2;
+};
+static_assert(sizeof(PriorLossParamsGPU) == 64, "PriorLossParamsGPU must match PriorLossParams");
+
+static PriorSkyParams make_sky_params(const PriorStep *prior, float fx, float fy, float cx, float cy) {
+    PriorSkyParams sp = {};
+    sp.fx = fx; sp.fy = fy; sp.cx = cx; sp.cy = cy;
+    if (prior && prior->sky && prior->sky_tex) {
+        memcpy(sp.up, prior->sky_frame, 3 * sizeof(float));
+        memcpy(sp.e1, prior->sky_frame + 3, 3 * sizeof(float));
+        memcpy(sp.e2, prior->sky_frame + 6, 3 * sizeof(float));
+        sp.tex_w = (uint32_t)prior->sky_w;
+        sp.tex_h = (uint32_t)prior->sky_h;
+        sp.enabled = 1;
+    } else {
+        sp.tex_w = 1;
+        sp.tex_h = 1;
+    }
+    return sp;
+}
+
+void msplat_render_aux_outputs(MTensor &depth, MTensor &final_T) {
+    depth = g_tcache.out_depth;
+    final_T = g_tcache.final_Ts;
+}
 
 void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
@@ -508,12 +597,14 @@ static void forward_pipeline(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    bool compute_loss,
+    const PriorStep *prior
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
+    const bool aux = prior && prior->aux;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
     // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
@@ -708,6 +799,29 @@ static void forward_pipeline(
         }
     };
 
+    // Depth + per-pixel background variant (prior-guided rendering, learned sky)
+    PriorSkyParams sky_params = make_sky_params(prior, fx, fy, cx, cy);
+    if (aux) {
+        g_tcache.ensure_aux(img_height, img_width, ctx->device);
+        g_tcache.ensure_dummies(ctx->device);
+    }
+    auto encode_rast_fwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTensor &sky_tex = (prior->sky && prior->sky_tex) ? *prior->sky_tex : g_tcache.dummy_tex;
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_forward_aux_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2);
+        ENC_BUF(enc, packed_xy_opac, 3); ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, packed_rgb, 5);
+        ENC_BUF(enc, gaussian_ids, 6); ENC_BUF(enc, depths, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11); ENC_BUF(enc, g_tcache.bg_img, 12);
+        ENC_BUF(enc, background, 13); ENC_BUF(enc, sky_tex, 14);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:15];
+        ENC_BUF(enc, viewmat, 16);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+    };
+
     auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
@@ -738,8 +852,9 @@ static void forward_pipeline(
     // Compute K_max conservatively from CPU-side data (no GPU sync needed).
     // avg_per_tile = capacity / num_tiles. Use 6x average to cover heavy-tailed
     // tile distributions. Overestimate is cheap: empty chunks early-exit immediately.
-    if (num_tiles >= 400) {
-        // High-res: enough tiles for good GPU occupancy, skip chunking
+    if (num_tiles >= 400 || aux) {
+        // High-res: enough tiles for good GPU occupancy, skip chunking.
+        // The aux rasterizer only has a monolithic variant.
         K_max = 1;
     } else {
         uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
@@ -776,7 +891,8 @@ static void forward_pipeline(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_prefix_map(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(encoder);
+            if (aux) encode_rast_fwd_aux(encoder);
+            else encode_rast_fwd(encoder);
             if (compute_loss) {
                 [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 encode_loss_fwd(encoder);
@@ -797,14 +913,15 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    const PriorStep *prior
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background, dummyGt, dummyWindow, 0.0f, false, prior);
     return g_tcache.out_img;
 }
 
@@ -824,12 +941,17 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    const PriorStep *prior
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
+    const bool aux = prior && prior->aux;
+    const bool sky = aux && prior->sky && prior->sky_tex && prior->sky_grad;
+    const bool exposure = prior && prior->exposure && prior->expo_params;
+    const bool scale_cap = prior && prior->log_max_scale_ratio > 0.f;
 
     // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
     // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
@@ -913,6 +1035,15 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &v_features_dc = g_tcache.v_features_dc;
     MTensor &v_features_rest = g_tcache.v_features_rest;
 
+    // Prior-guided extras. With exposure on, the photometric loss sees the transformed
+    // render (out_adj) and writes its cotangent to v_adj; exposure_backward maps that
+    // back to v_rendered.
+    if (aux) g_tcache.ensure_aux(img_height, img_width, ctx->device);
+    if (exposure) g_tcache.ensure_exposure(img_height, img_width, ctx->device);
+    if (prior) g_tcache.ensure_dummies(ctx->device);
+    MTensor &loss_in = exposure ? g_tcache.out_adj : out_img;
+    MTensor &loss_grad = exposure ? g_tcache.v_adj : v_rendered;
+
     // Wire backward outputs as Adam grads (MTensor references for gradient buffers)
     auto adam_grads = std::make_shared<std::array<MTensor, 6>>(
         std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest, v_opacity});
@@ -940,7 +1071,8 @@ std::tuple<MTensor, float> msplat_train_step(
     // --- K_max for chunked rasterization ---
     uint32_t K_max = 1;
     constexpr uint32_t CHUNK_SIZE = 512;
-    if (num_tiles >= 400) {
+    if (num_tiles >= 400 || aux) {
+        // The aux rasterizers only have a monolithic variant.
         K_max = 1;
     } else {
         uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
@@ -1062,19 +1194,20 @@ std::tuple<MTensor, float> msplat_train_step(
 
     // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
     // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+    // loss_in / loss_grad are out_img / v_rendered unless exposure compensation is on.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize grid = MTLSizeMake(img_width, img_height, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
@@ -1083,12 +1216,146 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_in, 0); ENC_BUF(enc, gt, 1);
         ENC_BUF(enc, loss_intermediates, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, v_rendered, 6);
+        ENC_BUF(enc, loss_grad, 6);
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+    };
+
+    // ======================= PRIOR-GUIDED ENCODE LAMBDAS =======================
+    // Only reached when the matching flag (aux / sky / exposure / scale_cap) is set,
+    // and therefore only with a non-null prior.
+
+    PriorSkyParams sky_params = make_sky_params(sky ? prior : nullptr, fx, fy, cx, cy);
+    uint32_t num_pix_u32 = img_width * img_height;
+    uint32_t expo_cam = prior ? (uint32_t)std::max(0, prior->cam_index) : 0u;
+
+    auto encode_rast_fwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTensor &sky_tex = sky ? *prior->sky_tex : g_tcache.dummy_tex;
+        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_forward_aux_kernel_cpso];
+        [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
+        [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
+        ENC_BUF(enc, tile_bins, 2);
+        ENC_BUF(enc, packed_xy_opac, 3); ENC_BUF(enc, packed_conic, 4); ENC_BUF(enc, packed_rgb, 5);
+        ENC_BUF(enc, gaussian_ids, 6); ENC_BUF(enc, depths, 7);
+        ENC_BUF(enc, final_Ts, 8); ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, out_img, 10);
+        ENC_BUF(enc, g_tcache.out_depth, 11); ENC_BUF(enc, g_tcache.bg_img, 12);
+        ENC_BUF(enc, background, 13); ENC_BUF(enc, sky_tex, 14);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:15];
+        ENC_BUF(enc, viewmat, 16);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+    };
+
+    auto encode_exposure_apply = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->exposure_apply_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->exposure_apply_kernel_cpso];
+        ENC_BUF(enc, out_img, 0);
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:1];
+        ENC_SCALAR(enc, expo_cam, 2); ENC_SCALAR(enc, num_pix_u32, 3);
+        ENC_BUF(enc, g_tcache.out_adj, 4);
+        [enc dispatchThreads:MTLSizeMake(num_pix_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    // Writes v_aux for every pixel (zeros where no prior applies) and masks loss_grad.
+    auto encode_prior_loss = [&](id<MTLComputeCommandEncoder> enc) {
+        const bool has_prior = prior->prior_depth && prior->prior_aux && prior->prior_w > 0 && prior->prior_h > 0;
+        MTensor &prior_depth = has_prior ? *prior->prior_depth : g_tcache.dummy_depth;
+        MTensor &prior_aux = has_prior ? *prior->prior_aux : g_tcache.dummy_aux;
+        MTensor &loss_terms = prior->loss_terms ? *prior->loss_terms : g_tcache.dummy_terms;
+        PriorLossParamsGPU lp = {};
+        lp.img_w = img_width; lp.img_h = img_height;
+        lp.prior_w = has_prior ? (uint32_t)prior->prior_w : 1u;
+        lp.prior_h = has_prior ? (uint32_t)prior->prior_h : 1u;
+        lp.depth_weight = prior->depth_weight;
+        lp.sky_weight = prior->sky_weight;
+        lp.fill_weight = prior->fill_weight;
+        lp.huber_delta = std::max(prior->huber_delta, 1e-6f);
+        lp.min_alpha = prior->min_alpha;
+        lp.inv_npix = 1.0f / (float)(img_width * img_height);
+        lp.has_depth = (has_prior && prior->has_depth) ? 1u : 0u;
+        lp.has_sky_mask = (has_prior && prior->has_sky_mask) ? 1u : 0u;
+        lp.mask_photo = prior->mask_photometric ? 1u : 0u;
+        [enc setComputePipelineState:ctx->prior_loss_kernel_cpso];
+        ENC_BUF(enc, g_tcache.out_depth, 0); ENC_BUF(enc, final_Ts, 1);
+        ENC_BUF(enc, prior_depth, 2); ENC_BUF(enc, prior_aux, 3);
+        [enc setBytes:&lp length:sizeof(lp) atIndex:4];
+        ENC_BUF(enc, g_tcache.v_aux, 5); ENC_BUF(enc, loss_grad, 6); ENC_BUF(enc, loss_terms, 7);
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    };
+
+    // v_adj → v_rendered, then one Adam step on this camera's 12 exposure parameters.
+    auto encode_exposure_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->exposure_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)256);
+        [enc setComputePipelineState:ctx->exposure_backward_kernel_cpso];
+        ENC_BUF(enc, out_img, 0);
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:1];
+        ENC_SCALAR(enc, expo_cam, 2); ENC_SCALAR(enc, num_pix_u32, 3);
+        ENC_BUF(enc, g_tcache.v_adj, 4); ENC_BUF(enc, v_rendered, 5);
+        [enc setBuffer:prior->expo_grad->buffer() offset:0 atIndex:6];
+        [enc dispatchThreads:MTLSizeMake(num_pix_u32, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc setComputePipelineState:ctx->exposure_adam_kernel_cpso];
+        [enc setBuffer:prior->expo_params->buffer() offset:0 atIndex:0];
+        [enc setBuffer:prior->expo_exp_avg->buffer() offset:0 atIndex:1];
+        [enc setBuffer:prior->expo_exp_avg_sq->buffer() offset:0 atIndex:2];
+        [enc setBuffer:prior->expo_grad->buffer() offset:0 atIndex:3];
+        ENC_SCALAR(enc, expo_cam, 4);
+        ENC_SCALAR(enc, prior->expo_step_size, 5); ENC_SCALAR(enc, prior->expo_bc2_sqrt, 6);
+        ENC_SCALAR(enc, prior->expo_reg, 7);
+        ENC_SCALAR(enc, adam_beta1, 8); ENC_SCALAR(enc, adam_beta2, 9); ENC_SCALAR(enc, adam_eps, 10);
+        [enc dispatchThreads:MTLSizeMake(12, 1, 1) threadsPerThreadgroup:MTLSizeMake(12, 1, 1)];
+    };
+
+    // Sky texture gradient from the transparent pixels, then one Adam step on the texture.
+    auto encode_sky_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        [enc setComputePipelineState:ctx->sky_backward_kernel_cpso];
+        ENC_BUF(enc, v_rendered, 0); ENC_BUF(enc, final_Ts, 1); ENC_BUF(enc, viewmat, 2);
+        [enc setBytes:&sky_params length:sizeof(sky_params) atIndex:3];
+        [enc setBytes:proj_img_size->data() length:sizeof(*proj_img_size) atIndex:4];
+        [enc setBuffer:prior->sky_grad->buffer() offset:0 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(img_width, img_height, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        uint32_t n = (uint32_t)prior->sky_tex->numel();
+        NSUInteger tpg = MIN(ctx->fused_adam_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
+        [enc setComputePipelineState:ctx->fused_adam_kernel_cpso];
+        [enc setBuffer:prior->sky_tex->buffer() offset:0 atIndex:0];
+        [enc setBuffer:prior->sky_grad->buffer() offset:0 atIndex:1];
+        [enc setBuffer:prior->sky_exp_avg->buffer() offset:0 atIndex:2];
+        [enc setBuffer:prior->sky_exp_avg_sq->buffer() offset:0 atIndex:3];
+        ENC_SCALAR(enc, prior->sky_step_size, 4);
+        ENC_SCALAR(enc, adam_beta1, 5); ENC_SCALAR(enc, adam_beta2, 6);
+        ENC_SCALAR(enc, prior->sky_bc2_sqrt, 7); ENC_SCALAR(enc, adam_eps, 8);
+        ENC_SCALAR(enc, n, 9);
+        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    };
+
+    // Post-loss prior stages, in dependency order: prior loss (masks loss_grad) →
+    // exposure backward (loss_grad → v_rendered) → sky backward (reads v_rendered).
+    auto encode_prior_post_loss = [&](id<MTLComputeCommandEncoder> enc) {
+        if (aux) {
+            encode_prior_loss(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        if (exposure) {
+            encode_exposure_bwd_adam(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+        if (sky) {
+            encode_sky_bwd_adam(enc);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+    };
+
+    auto encode_scale_cap = [&](id<MTLComputeCommandEncoder> enc) {
+        NSUInteger tpg = MIN(ctx->scale_ratio_cap_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->scale_ratio_cap_kernel_cpso];
+        ENC_BUF(enc, scales, 0);
+        ENC_SCALAR(enc, num_points_u32, 1);
+        ENC_SCALAR(enc, prior->log_max_scale_ratio, 2);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1138,6 +1405,22 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
+    };
+
+    auto encode_rast_bwd_aux = [&](id<MTLComputeCommandEncoder> enc) {
+        MTLSize num_tg = MTLSizeMake((img_width+RAST_BLOCK_X-1)/RAST_BLOCK_X, (img_height+RAST_BLOCK_Y-1)/RAST_BLOCK_Y, 1);
+        [enc setComputePipelineState:ctx->rasterize_backward_aux_kernel_cpso];
+        [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
+        [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
+        ENC_BUF(enc, gaussian_ids, 2); ENC_BUF(enc, tile_bins, 3);
+        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+        ENC_BUF(enc, depths, 7); ENC_BUF(enc, g_tcache.bg_img, 8);
+        ENC_BUF(enc, final_Ts, 9); ENC_BUF(enc, final_idx, 10);
+        ENC_BUF(enc, v_rendered, 11); ENC_BUF(enc, g_tcache.v_aux, 12);
+        ENC_BUF(enc, v_xy, 13); ENC_BUF(enc, v_conic, 14);
+        ENC_BUF(enc, v_colors_rast, 15); ENC_BUF(enc, v_opacity, 16);
+        ENC_BUF(enc, v_depth, 17);
+        [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
     };
 
     // Packed SH Adam hyperparameters (must match SHAdamParams in .metal)
@@ -1234,6 +1517,13 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
+        // Only the aux backward writes v_depth, but project_and_sh_backward always reads it,
+        // so it is cleared every step (g_tcache is shared by every trainer in the process).
+        [blit fillBuffer:v_depth.buffer() range:NSMakeRange(0, v_depth.nbytes()) value:0];
+        if (aux && prior->loss_terms)
+            [blit fillBuffer:prior->loss_terms->buffer() range:NSMakeRange(0, prior->loss_terms->nbytes()) value:0];
+        if (sky)
+            [blit fillBuffer:prior->sky_grad->buffer() range:NSMakeRange(0, prior->sky_grad->nbytes()) value:0];
         // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
         [blit endEncoding];
     };
@@ -1293,24 +1583,38 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_prefix_map(enc);
             [enc endEncoding];
 
-            // Stage 3: rast_fwd
+            // Stage 3: rast_fwd (+ exposure transform)
             enc = make_profiled_encoder(2);
-            encode_rast_fwd(enc);
+            if (aux) encode_rast_fwd_aux(enc);
+            else encode_rast_fwd(enc);
+            if (exposure) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_exposure_apply(enc);
+            }
             [enc endEncoding];
 
-            // Stage 4+5: loss_fwd_bwd (fused)
+            // Stage 4+5: loss_fwd_bwd (fused) + prior losses, exposure and sky backward
             enc = make_profiled_encoder(3);
             encode_loss_fwd_bwd(enc);
+            if (aux || exposure) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_prior_post_loss(enc);
+            }
             [enc endEncoding];
 
             // Stage 5: rast_bwd
             enc = make_profiled_encoder(4);
-            encode_rast_bwd(enc);
+            if (aux) encode_rast_bwd_aux(enc);
+            else encode_rast_bwd(enc);
             [enc endEncoding];
 
-            // Stage 6: proj_sh_bwd + Adam
+            // Stage 6: proj_sh_bwd + Adam (+ needle cap)
             enc = make_profiled_encoder(5);
             encode_proj_sh_bwd_adam(enc);
+            if (scale_cap) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                encode_scale_cap(enc);
+            }
             [enc endEncoding];
 
             // Stage 7: grad_stats
@@ -1373,15 +1677,27 @@ std::tuple<MTensor, float> msplat_train_step(
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_prefix_map(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_fwd(enc);
+            if (aux) encode_rast_fwd_aux(enc);
+            else encode_rast_fwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (exposure) {
+                encode_exposure_apply(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
             // --- Fused loss forward + backward ---
             encode_loss_fwd_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_rast_bwd(enc);
+            // --- Prior losses, exposure and sky backward (each ends with a barrier) ---
+            encode_prior_post_loss(enc);
+            if (aux) encode_rast_bwd_aux(enc);
+            else encode_rast_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_proj_sh_bwd_adam(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (scale_cap) {
+                encode_scale_cap(enc);
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
 
             // --- Accumulate grad stats ---
             encode_grad_stats(enc);

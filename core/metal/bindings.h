@@ -38,6 +38,44 @@ void msplat_drain_gpu_times(std::vector<double>& out);
 void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages, int& n_stages,
                               const char** stage_names);
 
+// Optional extras for prior-guided training (depth/sky priors, learned sky, exposure,
+// needle cap). A null PriorStep* — the default — runs the original pipeline unchanged.
+struct PriorStep {
+    // Rasterize expected depth and alpha with a per-pixel background. Required by the
+    // learned sky and by every prior loss; when false the default rasterizer runs and
+    // the sky and prior-loss fields below are ignored. Forces the monolithic rasterizer.
+    bool aux = false;
+
+    // Learned sky: equirect texture (sky_h, sky_w, 3) sampled by view direction and
+    // composited behind the gaussians.
+    bool sky = false;
+    MTensor *sky_tex = nullptr;
+    MTensor *sky_grad = nullptr, *sky_exp_avg = nullptr, *sky_exp_avg_sq = nullptr;  // train only
+    int sky_w = 0, sky_h = 0;
+    float sky_frame[9] = {};              // up, e1 (azimuth 0), e2 (azimuth 90 deg)
+    float sky_step_size = 0.f, sky_bc2_sqrt = 1.f;
+
+    // Per-camera priors at their native resolution (train only).
+    MTensor *prior_depth = nullptr;       // (prior_h, prior_w) float, scene units, 0 = invalid
+    MTensor *prior_aux = nullptr;         // (prior_h, prior_w, 4) uint8: confidence, sky, keep, -
+    int prior_w = 0, prior_h = 0;
+    bool has_depth = false, has_sky_mask = false;
+    float depth_weight = 0.f, sky_weight = 0.f, fill_weight = 0.f;
+    float huber_delta = 0.05f, min_alpha = 0.25f;
+    bool mask_photometric = true;
+    MTensor *loss_terms = nullptr;        // [4] float: depth, sky, fill, - (zeroed every step)
+
+    // Per-image affine exposure compensation (train only).
+    bool exposure = false;
+    int cam_index = 0;
+    MTensor *expo_params = nullptr, *expo_exp_avg = nullptr, *expo_exp_avg_sq = nullptr;  // (num_cams, 12)
+    MTensor *expo_grad = nullptr;         // [12], zeroed by the GPU after each update
+    float expo_step_size = 0.f, expo_bc2_sqrt = 1.f, expo_reg = 0.f;
+
+    // Needle cap: largest scale <= exp(log_max_scale_ratio) x median scale (train only).
+    float log_max_scale_ratio = 0.f;      // <= 0 disables
+};
+
 // Render-only forward pass (no loss computation)
 // Returns: out_img (H, W, 3) as MTensor
 MTensor msplat_render(
@@ -48,8 +86,14 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    const PriorStep *prior = nullptr
 );
+
+// After msplat_render with prior->aux set: the expected-depth numerator sum_i w_i z_i
+// (H, W) and the final transmittance (H, W), so alpha = 1 - final_T and expected
+// depth = depth / alpha. Aliases of cached buffers — sync, then copy before the next call.
+void msplat_render_aux_outputs(MTensor &depth, MTensor &final_T);
 
 // Fused forward + backward + Adam + grad_stats in one encoder
 // Returns: (radii [N], loss_value float)
@@ -69,7 +113,8 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    const PriorStep *prior = nullptr
 );
 
 int msplat_densify(

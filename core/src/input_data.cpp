@@ -1,6 +1,7 @@
 #include "input_data.hpp"
 #include "loaders.hpp"
 #include "msplat.hpp"
+#include "priors.hpp"
 #include <nlohmann/json.hpp>
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,10 @@ void Camera::loadImage(float downscaleFactor) {
 
     // Undistort if needed
     if (hasDistortion()) {
+        // Undistortion crops and remaps the image, which would misalign every prior pixel.
+        if (hasPriorFiles())
+            throw std::runtime_error("Priors need undistorted images, but " + filePath +
+                " has lens distortion. Undistort the dataset first (e.g. colmap image_undistorter).");
         auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
         raw = std::move(result.image);
         fx = result.fx; fy = result.fy;
@@ -197,7 +202,7 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
 
 // ── Format dispatcher ───────────────────────────────────────────────────────
 
-InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+static InputData loadByFormat(const std::string &path, const std::string &colmapImagePath) {
     fs::path root(path);
 
     // Nerfstudio: transforms.json
@@ -214,4 +219,11 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
 
     throw std::runtime_error("Unrecognized dataset format in: " + path +
         "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+}
+
+InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+    InputData data = loadByFormat(path, colmapImagePath);
+    data.rootDir = path;
+    attachPriors(data);  // <dataset>/priors, when present
+    return data;
 }
