@@ -83,6 +83,8 @@ def main() -> None:
     ap.add_argument("--iterations", type=int, default=5000)
     ap.add_argument("--render-only", action="store_true", help="load out/model.ckpt instead of training")
     ap.add_argument("--preview-every", type=int, default=1000, help="save preview renders every N steps (0: off)")
+    ap.add_argument("--max-scale-ratio", type=float, default=None,
+                    help="cap on a gaussian's largest/median scale (default: the street preset's)")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
@@ -92,8 +94,9 @@ def main() -> None:
 
     ds = msplat.load_dataset(args.data)
     print("priors attached:", ds.prior_counts(), flush=True)
+    extra = {} if args.max_scale_ratio is None else {"max_scale_ratio": args.max_scale_ratio}
     cfg = msplat.street_config(iterations=args.iterations, num_downscales=1, resolution_schedule=750,
-                               output=os.path.join(args.out, "street.ply"))
+                               output=os.path.join(args.out, "street.ply"), **extra)
     t = msplat.GaussianTrainer(ds, cfg)
     ckpt = os.path.join(args.out, "model.ckpt")
     if args.render_only:

@@ -45,13 +45,15 @@ and the same for `b_`) and the two `*-meta.json` files in `data/meta/`, then:
 
 ```bash
 pip install torch transformers pillow numpy opencv-python-headless   # models and matching (CPU is fine)
-python prepare.py --out data/street
+python prepare.py --out data/street --size 1280x960
 python align_depth.py --data data/street --out data/street_aligned
 python prepare.py --out data/street_aligned --points-only --voxel 0.03
-python train.py --data data/street_aligned --out runs/street --iterations 3000
+python train.py --data data/street_aligned --out runs/street --iterations 4000 --max-scale-ratio 3
 python publish.py --data data/street_aligned --run runs/street --out street.splat --url <where street.splat will be served>
 ```
 
+1280×960 views (11 px/° at the centre) roughly match the faces' resolution; the default
+640×480 trains about twice as fast but looks soft full-screen in a web viewer.
 `prepare.py --points-only --voxel 0.03` rebuilds just the initial point cloud from
 the saved priors (no model inference). `publish.py` writes the `.splat` for web viewers
 (in metres, the sky as a dome of splats, opening at the first capture looking down the

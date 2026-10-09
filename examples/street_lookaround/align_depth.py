@@ -151,8 +151,13 @@ def triangulate(ca, ra, cb, rb):
 
 
 def bilateral_field(h, w, px, logr, logd_anchor, logd_img, sigma_px=110.0, sigma_d=0.35):
-    """Joint bilateral spread of anchor log ratios over the image (at 1/4 resolution)."""
-    s = 4
+    """Joint bilateral spread of anchor log ratios over the image (at 1/4 resolution).
+
+    Pixel constants are for 640-wide views and scale with the width; `near` is returned
+    in 640-wide pixels."""
+    k = w / 640
+    s = max(1, round(4 * k))
+    sigma_px *= k
     hs, ws = h // s, w // s
     yy, xx = np.mgrid[0:hs, 0:ws]
     gx, gy = (xx + 0.5) * s, (yy + 0.5) * s
@@ -163,7 +168,7 @@ def bilateral_field(h, w, px, logr, logd_anchor, logd_img, sigma_px=110.0, sigma
         wgt = np.exp(-d2 / (2 * sigma_px ** 2)) * np.exp(-((ld - la) ** 2) / (2 * sigma_d ** 2))
         num += wgt * r
         den += wgt
-        near = np.minimum(near, np.sqrt(d2) + 400.0 * np.abs(ld - la))
+        near = np.minimum(near, np.sqrt(d2) / k + 400.0 * np.abs(ld - la))
     up = lambda a: np.asarray(Image.fromarray(a.astype(np.float32)).resize((w, h), Image.BILINEAR))
     return up(num), up(den), up(near)
 

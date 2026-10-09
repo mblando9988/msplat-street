@@ -13,6 +13,8 @@ Writes a .splat and prints a viewer link. A plain export of this scene opens bad
 - The learned sky is a texture behind the gaussians, not gaussians, so viewers show black
   above the horizon. It is added as a dome of large, distant splats coloured from the
   texture (same frame and mapping as the trainer's sky).
+- The trainer draws each splat with a small screen-space blur that viewers don't apply,
+  so splats thinner than a pixel show up as needles. The blur is baked into their size.
 """
 
 from __future__ import annotations
@@ -151,7 +153,8 @@ def main() -> None:
     args = ap.parse_args()
 
     with open(os.path.join(args.data, "transforms.json")) as f:
-        frames = sorted(json.load(f)["frames"], key=lambda fr: fr["file_path"])
+        meta = json.load(f)
+    frames = sorted(meta["frames"], key=lambda fr: fr["file_path"])
     names = [os.path.splitext(os.path.basename(fr["file_path"]))[0] for fr in frames]
 
     ds = msplat.load_dataset(args.data)
@@ -186,8 +189,18 @@ def main() -> None:
     means = np.stack([g["x"], g["y"], g["z"]], -1).astype(np.float64)
     quats = np.stack([g[f"rot_{k}"] for k in range(4)], -1).astype(np.float64)
     quats /= np.maximum(np.linalg.norm(quats, axis=-1, keepdims=True), 1e-12)
+    # The trainer draws every splat with 0.3 px^2 added to its screen-space covariance
+    # (opacity unchanged), so it leaves many splats thinner than a pixel; viewers don't add
+    # it and show those as hard needles. Bake the same blur into the 3D size, at the
+    # splat's distance from the nearest capture and the trained focal length.
+    fx = float(np.median([fr.get("fl_x", meta.get("fl_x")) for fr in frames]))
+    fx *= ds.image(0).shape[1] / (frames[0].get("w") or meta["w"])
+    centers = np.unique(np.round([p[:3, 3] for p in poses], 6), axis=0)
+    dist = np.min([np.linalg.norm(means - c, axis=1) for c in centers], axis=0)
+    blur = math.sqrt(0.3) * dist / fx
+    scales = np.sqrt(np.exp(2 * np.stack([g[f"scale_{k}"] for k in range(3)], -1)) + blur[:, None] ** 2)
     scene = splat_records(to_viewer(means),
-                          np.exp(np.stack([g[f"scale_{k}"] for k in range(3)], -1)) / units_per_m,
+                          scales / units_per_m,
                           np.stack([g[f"f_dc_{k}"] for k in range(3)], -1) * C0 + 0.5,
                           1 / (1 + np.exp(-g["opacity"])),
                           quat_mul(quat_from_matrix(rot), quats))
