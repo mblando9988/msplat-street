@@ -123,7 +123,9 @@ def main() -> None:
         print(f"trained {args.iterations} steps in {time.time() - t0:.0f}s, {t.splat_count} gaussians", flush=True)
 
     # ── Training views: photo | render | depth ──────────────────────────────
-    show = ["pano_a_y-015_p+00", "pano_a_y+045_p+00", "pano_b_y-075_p+00", "pano_b_y+015_p+00", "pano_a_y+020_p+35"]
+    show = ["pano_a_y-015_p+00", "pano_a_y+045_p+00", "pano_b_y-075_p+00", "pano_b_y+015_p+00", "pano_a_y+020_p+35",
+            "pano_b_y+000_p+60"]
+    show = [n for n in show if n in names]
     rows, psnrs = [], {}
     for i, name in enumerate(names):
         gt = ds.image(i)

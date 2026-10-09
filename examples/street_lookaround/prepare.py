@@ -25,14 +25,22 @@ from lookaround import FACE_NAMES, Panorama, make_view, render_view
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # The two captures of this example: face index -> file. The back face (2) was not
-# downloaded, so views stay within +-120 deg of the heading.
+# downloaded, so level views stay within +-120 deg of the heading. The caps (4 top,
+# 5 bottom) see what the side faces cannot: overhead structure and the road around
+# the car.
 PANORAMAS = [
-    ("pano_a", "meta/d1177723-meta.json", {0: "faces/a_front.webp", 1: "faces/a_right.webp", 3: "faces/a_left.webp"}),
-    ("pano_b", "meta/1d0e2c66-meta.json", {0: "faces/b_front.webp", 1: "faces/b_right.webp", 3: "faces/b_left.webp"}),
+    ("pano_a", "meta/d1177723-meta.json", {0: "faces/a_front.webp", 1: "faces/a_right.webp", 3: "faces/a_left.webp",
+                                           4: "faces/a_top.webp", 5: "faces/a_bottom.webp"}),
+    ("pano_b", "meta/1d0e2c66-meta.json", {0: "faces/b_front.webp", 1: "faces/b_right.webp", 3: "faces/b_left.webp",
+                                           4: "faces/b_top.webp", 5: "faces/b_bottom.webp"}),
 ]
 
 # (yaw, pitch) in degrees relative to the panorama heading
-VIEW_GRID = [(-75, 0), (-45, 0), (-15, 0), (15, 0), (45, 0), (75, 0), (-60, 35), (-20, 35), (20, 35), (60, 35)]
+VIEW_GRID = [(-75, 0), (-45, 0), (-15, 0), (15, 0), (45, 0), (75, 0), (-60, 35), (-20, 35), (20, 35), (60, 35),
+             (-90, 60), (0, 60), (90, 60), (-90, -60), (0, -60), (90, -60), (180, -60)]
+
+# Directly below the camera Look Around blurs out the capture vehicle: not road texture
+NADIR_MASK_DEG = 55.0
 
 DYNAMIC_CLASSES = {"car", "truck", "bus", "van", "person", "bicycle", "motorbike", "minibike", "boat", "airplane"}
 
@@ -193,6 +201,8 @@ def main() -> None:
             })
             log(f"{p.name} {FACE_NAMES[idx]:6s} metadata {meta_w}x{meta_h} -> file {img.shape[1]}x{img.shape[0]} "
                 f"(x{img.shape[1] / meta_w:.3f}), {px_per_deg:.1f} px/deg")
+        if p.cap_orient:
+            log(f"{p.name} cap orientation (axis, mirror) from side-face overlap: {p.cap_orient}")
     fx = (width / 2) / math.tan(math.radians(args.hfov) / 2)
     log(f"views {width}x{height}, hfov {args.hfov} deg, fx {fx:.1f}, {fx * math.pi / 180:.1f} px/deg at the centre "
         f"(rendered at 2x and box-filtered)")
@@ -212,6 +222,8 @@ def main() -> None:
             depth = depth_fn(img)
             sky, dynamic = seg_fn(img)
             covered = cov > 0.99
+            elevation = np.degrees(np.arcsin(np.clip(view.rays(1) @ np.array([0.0, 0.0, 1.0]), -1, 1)))
+            covered &= elevation > -NADIR_MASK_DEG
             keep = covered & ~dynamic
             sky &= covered
             depth_valid = keep & ~sky & (depth > 0.5)

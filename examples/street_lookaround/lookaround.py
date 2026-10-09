@@ -25,6 +25,7 @@ from PIL import Image
 
 FACE_NAMES = {0: "front", 1: "right", 2: "back", 3: "left", 4: "top", 5: "bottom"}
 SIDE_FACES = (0, 1, 2, 3)
+CAP_FACES = (4, 5)
 
 
 @dataclass
@@ -33,6 +34,10 @@ class Panorama:
     meta: dict
     faces: dict[int, np.ndarray] = field(default_factory=dict)  # face index -> (H, W, 3) float32
     files: dict[int, str] = field(default_factory=dict)
+    # Caps (top/bottom) are equirect patches in a frame whose forward axis is the zenith
+    # or nadir; the metadata's yaw/pitch/roll leave their in-plane orientation ambiguous,
+    # so it is calibrated against the side faces where they overlap: (axis, mirror).
+    cap_orient: dict[int, tuple[int, bool]] = field(default_factory=dict)
 
     @classmethod
     def load(cls, name: str, meta_path: str, face_files: dict[int, str]) -> "Panorama":
@@ -42,6 +47,9 @@ class Panorama:
         for idx, path in face_files.items():
             pano.faces[idx] = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
             pano.files[idx] = path
+        for idx in CAP_FACES:
+            if idx in pano.faces:
+                pano.cap_orient[idx] = pano.calibrate_cap(idx)
         return pano
 
     # ── Placement ────────────────────────────────────────────────────────────
@@ -61,34 +69,84 @@ class Panorama:
 
     # ── Sampling ─────────────────────────────────────────────────────────────
 
+    def _cap_axes(self, idx: int, orient: tuple[int, bool]):
+        f, r, u = self.basis()
+        forward = u if idx == 4 else -u
+        right = [f, r, -f, -r][orient[0]]
+        down = np.cross(forward, right)  # x forward, y right, z down
+        return forward, right, down
+
+    def _sample_face(self, idx: int, dirs: np.ndarray, orient=None):
+        """(rgb, weight) of one face along directions; weight feathers to 0 at its border."""
+        cam = self.meta["camera_metadata"][idx]
+        img = self.faces[idx]
+        h, w = img.shape[:2]
+        if idx in SIDE_FACES:
+            f, r, u = self.basis()
+            x, y, z = dirs @ f, dirs @ r, dirs @ u
+            lon = np.arctan2(y, x)
+            lat = np.arcsin(np.clip(z / np.linalg.norm(dirs, axis=-1), -1.0, 1.0))
+            dlon = (lon - cam["yaw"] + math.pi) % (2 * math.pi) - math.pi
+            dlat = lat - cam["cy"]
+        else:
+            forward, right, down = self._cap_axes(idx, orient or self.cap_orient[idx])
+            x, y, z = dirs @ forward, dirs @ right, dirs @ down
+            dlon = np.arctan2(y, x)
+            if (orient or self.cap_orient[idx])[1]:
+                dlon = -dlon
+            dlat = np.arcsin(np.clip(-z / np.linalg.norm(dirs, axis=-1), -1.0, 1.0))
+            dlon = np.where(x > 0, dlon, math.pi)  # behind the cap: outside
+        half_s, half_h = cam["fov_s"] / 2, cam["fov_h"] / 2
+        weight = np.clip(np.minimum(half_s - np.abs(dlon), half_h - np.abs(dlat)) / math.radians(3), 0, 1)
+        px = (dlon / cam["fov_s"] + 0.5) * w - 0.5
+        py = (0.5 - dlat / cam["fov_h"]) * h - 0.5
+        return bilinear(img, px, py), weight
+
+    def calibrate_cap(self, idx: int) -> tuple[int, bool]:
+        """Cap orientation that best matches the side faces in their overlap band."""
+        f, r, u = self.basis()
+        # directions in the band the cap shares with the side faces
+        lat0 = math.radians(64) if idx == 4 else math.radians(-32)
+        lons = np.radians(np.arange(-120, 121, 0.5))
+        lats = lat0 + np.radians(np.linspace(-3, 3, 13))
+        L, A = np.meshgrid(lons, lats)
+        dirs = (np.cos(A)[..., None] * (np.cos(L)[..., None] * f + np.sin(L)[..., None] * r)
+                + np.sin(A)[..., None] * u)
+        side = np.zeros(dirs.shape[:-1] + (3,))
+        sw = np.zeros(dirs.shape[:-1])
+        for k in SIDE_FACES:
+            if k in self.faces:
+                c, wk = self._sample_face(k, dirs)
+                side += wk[..., None] * c
+                sw += wk
+        best, best_err = (0, False), np.inf
+        for axis in range(4):
+            for mirror in (False, True):
+                c, wc = self._sample_face(idx, dirs, (axis, mirror))
+                ok = (wc > 0.5) & (sw > 0.5)
+                if ok.sum() < 200:
+                    continue
+                err = float(np.mean(np.abs(c[ok] - side[ok] / sw[ok][:, None])))
+                if err < best_err:
+                    best, best_err = (axis, mirror), err
+        return best
+
     def sample(self, dirs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Colour along world directions (..., 3), feather-blended across face seams.
 
         Returns (rgb (..., 3), coverage (...) in [0, 1]); coverage 0 where no loaded
-        side face sees the direction (the back face is often missing).
+        face sees the direction (the back face is often missing).
         """
-        f, r, u = self.basis()
-        x, y, z = dirs @ f, dirs @ r, dirs @ u
-        lon = np.arctan2(y, x)
-        lat = np.arcsin(np.clip(z / np.linalg.norm(dirs, axis=-1), -1.0, 1.0))
         rgb = np.zeros(dirs.shape[:-1] + (3,), np.float64)
         wsum = np.zeros(dirs.shape[:-1], np.float64)
-        for idx in SIDE_FACES:
+        for idx in SIDE_FACES + CAP_FACES:
             if idx not in self.faces:
                 continue
-            cam = self.meta["camera_metadata"][idx]
-            img = self.faces[idx]
-            h, w = img.shape[:2]
-            dlon = (lon - cam["yaw"] + math.pi) % (2 * math.pi) - math.pi
-            dlat = lat - cam["cy"]
-            half_s, half_h = cam["fov_s"] / 2, cam["fov_h"] / 2
-            # feather weight: angular distance to the face border (seams overlap ~5.6 deg)
-            weight = np.clip(np.minimum(half_s - np.abs(dlon), half_h - np.abs(dlat)) / math.radians(3), 0, 1)
+            # feather weight: angular distance to the face border (side seams overlap ~5.6 deg)
+            c, weight = self._sample_face(idx, dirs)
             if not weight.any():
                 continue
-            px = (dlon / cam["fov_s"] + 0.5) * w - 0.5
-            py = (0.5 - dlat / cam["fov_h"]) * h - 0.5
-            rgb += weight[..., None] * bilinear(img, px, py)
+            rgb += weight[..., None] * c
             wsum += weight
         covered = wsum > 1e-6
         rgb[covered] /= wsum[covered][..., None]
