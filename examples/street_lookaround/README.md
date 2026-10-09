@@ -49,9 +49,12 @@ python prepare.py --out data/street
 python align_depth.py --data data/street --out data/street_aligned
 python prepare.py --out data/street_aligned --points-only --voxel 0.03
 python train.py --data data/street_aligned --out runs/street --iterations 3000
+python publish.py --data data/street_aligned --run runs/street --out street.splat --url <where street.splat will be served>
 ```
 
 `prepare.py --points-only --voxel 0.03` rebuilds just the initial point cloud from
-the saved priors (no model inference).
+the saved priors (no model inference). `publish.py` writes the `.splat` for web viewers
+(in metres, the sky as a dome of splats, opening at the first capture looking down the
+road) and prints the viewer link.
 
 The Look Around imagery is Apple's; it is not included in this repository.
