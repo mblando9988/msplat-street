@@ -30,7 +30,7 @@ def colorize_depth(depth: np.ndarray, alpha: np.ndarray, near: float = 2.0, far:
     valid = alpha > 0.5
     x = np.zeros_like(depth)
     x[valid] = (1 / np.maximum(depth[valid], near) - 1 / far) / (1 / near - 1 / far)
-    x = np.clip(x, 0, 1)
+    x = np.clip(x, 0, 1) ** 0.5  # spread the far range
     anchors = np.array([[0.05, 0.03, 0.25], [0.10, 0.35, 0.75], [0.15, 0.75, 0.60],
                         [0.95, 0.85, 0.20], [0.85, 0.20, 0.10]])
     pos = x * (len(anchors) - 1)
@@ -123,7 +123,9 @@ def main() -> None:
         print(f"trained {args.iterations} steps in {time.time() - t0:.0f}s, {t.splat_count} gaussians", flush=True)
 
     # ── Training views: photo | render | depth ──────────────────────────────
-    show = ["pano_a_y-015_p+00", "pano_a_y+045_p+00", "pano_b_y-075_p+00", "pano_b_y+015_p+00", "pano_a_y+020_p+35"]
+    show = ["pano_a_y-015_p+00", "pano_a_y+045_p+00", "pano_b_y-075_p+00", "pano_b_y+015_p+00", "pano_a_y+020_p+35",
+            "pano_b_y+000_p+60"]
+    show = [n for n in show if n in names]
     rows, psnrs = [], {}
     for i, name in enumerate(names):
         gt = ds.image(i)
@@ -158,7 +160,7 @@ def main() -> None:
     for label_text, pos, fwd in [
         ("novel: halfway between captures, forward", (pa + pb) / 2, travel),
         ("novel: 1.5 m left of capture A, forward", pa - 1.5 * side * (gap / 5.54), travel),
-        ("novel: under the arch, looking up 30 deg", pb, rotate(travel, side, 30)),
+        ("novel: halfway, looking up 45 deg at the arch", (pa + pb) / 2, rotate(travel, side, 45)),
         ("novel: halfway, looking right 60 deg", (pa + pb) / 2, rotate(travel, up, -60)),
     ]:
         img = t.render_from_pose(look_pose(pos, fwd, up), ref)

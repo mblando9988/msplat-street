@@ -22,10 +22,17 @@ runs the whole pipeline on a CPU (Linux works), no Apple GPU needed.
    too. Confidence falls off with distance and at depth edges.
 3. **Initialization**. All views' depth is back-projected and merged in voxels that
    grow with distance, giving the initial point cloud.
-4. **Training** (`train.py`). `msplat.street_config()`: log-depth Huber loss to the
+4. **Alignment to measured geometry** (`align_depth.py`). Monocular depth gets the
+   shape right but the scale wrong, differently in every view (here 0.42x to 1.34x
+   of the triangulated depth), so each view pulls the same surface to its own depth.
+   SIFT matches between the two capture points are triangulated (after refining their
+   relative rotation on the same matches), every view's prior is bent onto those
+   anchors with a joint bilateral correction, and the road becomes the exact plane fitted
+   to its anchors (the two cameras come out 2.39 m and 2.40 m above it).
+5. **Training** (`train.py`). `msplat.street_config()`: log-depth Huber loss to the
    priors, a learned sky behind the gaussians with sky pixels pushed transparent,
    per-image exposure compensation, masks, and a cap on needle-shaped gaussians.
-5. **Photos**: training views next to the photos with rendered depth, novel views
+6. **Photos**: training views next to the photos with rendered depth, novel views
    between and around the capture points, and a drive-through animation.
 
 Every size is stated on the way: `prepare.py` logs each face's metadata size, file
@@ -37,9 +44,11 @@ Put the face images in `data/faces/` (`a_front.webp`, `a_right.webp`, `a_left.we
 and the same for `b_`) and the two `*-meta.json` files in `data/meta/`, then:
 
 ```bash
-pip install torch transformers pillow numpy   # depth and segmentation models (CPU is fine)
+pip install torch transformers pillow numpy opencv-python-headless   # models and matching (CPU is fine)
 python prepare.py --out data/street
-python train.py --data data/street --out runs/street --iterations 3000
+python align_depth.py --data data/street --out data/street_aligned
+python prepare.py --out data/street_aligned --points-only --voxel 0.03
+python train.py --data data/street_aligned --out runs/street --iterations 3000
 ```
 
 `prepare.py --points-only --voxel 0.03` rebuilds just the initial point cloud from
