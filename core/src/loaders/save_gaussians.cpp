@@ -90,8 +90,15 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
         uint8_t a = (uint8_t)std::clamp(sig * 255.0f, 0.0f, 255.0f);
         o.write(reinterpret_cast<const char*>(&a), 1);
 
+        // .splat stores a unit quaternion in bytes and viewers do not renormalize it;
+        // the trained quaternions drift from unit length (rotation uses q / |q|)
+        const float *qi = qp + i * 4;
+        float qn = std::sqrt(qi[0] * qi[0] + qi[1] * qi[1] + qi[2] * qi[2] + qi[3] * qi[3]);
         uint8_t q[4];
-        for (int j = 0; j < 4; j++) q[j] = (uint8_t)std::clamp(qp[i*4+j] * 128.0f + 128.0f, 0.0f, 255.0f);
+        for (int j = 0; j < 4; j++) {
+            float c = qn > 0.f ? qi[j] / qn : (j == 0 ? 1.f : 0.f);
+            q[j] = (uint8_t)std::clamp(c * 128.0f + 128.0f, 0.0f, 255.0f);
+        }
         o.write(reinterpret_cast<const char*>(q), 4);
     }
 }
