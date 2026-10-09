@@ -1218,7 +1218,8 @@ kernel void nd_rasterize_backward_kernel(
     }
 }
 
-// given v_xy_pix, get v_xyz
+// given v_xy_pix, get v_xyz, through the perspective divide: x_pix = W/2 * p_hom.x / p_hom.w
+// + cx - 0.5, so the w row carries the depth term (forward motion's looming parallax)
 inline float3 project_pix_vjp(
     constant float *mat, const float3 p, const uint2 img_size, const float2 v_xy
 ) {
@@ -1226,16 +1227,15 @@ inline float3 project_pix_vjp(
     float4 p_hom = transform_4x4(mat, p);
     float rw = 1.f / (p_hom.w + 1e-6f);
 
-    float3 v_ndc = {0.5f * img_size.x * v_xy.x, 0.5f * img_size.y * v_xy.y, 0.0f};
+    float2 v_ndc = {0.5f * img_size.x * v_xy.x, 0.5f * img_size.y * v_xy.y};
     float4 v_proj = {
-        v_ndc.x * rw, v_ndc.y * rw, 0., -(v_ndc.x + v_ndc.y) * rw * rw
+        v_ndc.x * rw, v_ndc.y * rw, 0., -(v_ndc.x * p_hom.x + v_ndc.y * p_hom.y) * rw * rw
     };
-    // df / d_world = df / d_cam * d_cam / d_world
-    // = v_proj * P[:3, :3]
+    // df / d_world = df / d_hom * d_hom / d_world = v_proj * P[:, :3]
     return {
-        mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z,
-        mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z,
-        mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z
+        mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z + mat[12] * v_proj.w,
+        mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z + mat[13] * v_proj.w,
+        mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z + mat[14] * v_proj.w
     };
 }
 
@@ -1454,7 +1454,9 @@ inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
             x * (v_R[0][2] + v_R[2][0]) + y * (v_R[1][2] + v_R[2][1]) -
             2.f * z * (v_R[0][0] + v_R[1][1]) + w * (v_R[0][1] - v_R[1][0])
         );
-    return v_quat;
+    // through the normalization q / |q|: drop the radial component, scale by 1 / |q|
+    float radial = v_quat.x * w + v_quat.y * x + v_quat.z * y + v_quat.w * z;
+    return (v_quat - radial * float4(w, x, y, z)) * s;
 }
 
 // given cotangent v in output space (e.g. d_L/d_cov3d) in R(6)
@@ -3286,15 +3288,16 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
-            tg_f2[dy][dx] = 2.0f*dsyq;
-            tg_f3[dy][dx] = dsxy;
-            if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
-                int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
-                if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
-                    ssim_sum += (A * B) / (Cd * D);
-                    l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
-                }
+            // The loss only covers the image: derivative fields outside it are zero, so
+            // the horizontal pass below reads zeros past the edges like the vertical one.
+            int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
+            bool inside = gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H;
+            tg_f1[dy][dx] = inside ? dmu - 2.0f*mu_y*dsyq - mu_x*dsxy : 0.0f;
+            tg_f2[dy][dx] = inside ? 2.0f*dsyq : 0.0f;
+            tg_f3[dy][dx] = inside ? dsxy : 0.0f;
+            if (inside && dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
+                ssim_sum += (A * B) / (Cd * D);
+                l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

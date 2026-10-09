@@ -159,6 +159,22 @@ cd swift && swift build
 
 Requires macOS 14+, Apple Silicon. No external dependencies.
 
+### Linux (CPU backend)
+
+On Linux the same commands build a CPU backend (`core/cpu`): multithreaded C++ ports
+of the Metal kernels behind the same interface, with stb for image I/O. Training,
+rendering, evaluation and the Python API work unchanged, only slower. Set
+`MSPLAT_THREADS` to limit the worker threads. PNG, JPEG, BMP, TGA, GIF, PSD, HDR and
+PNM images are supported; convert WebP or HEIC first.
+
+```bash
+pip install -e .                                   # Python module
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+```
+
+`-DMSPLAT_CPU_NATIVE=OFF` builds without `-march=native` for machines other than the
+build host.
+
 ## Benchmarks
 
 mipnerf360, M4 Max. msplat runs 7K iterations with no downscales:
